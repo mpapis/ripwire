@@ -418,11 +418,15 @@ printf '%s' "$( row "$OUT14N" 11 )" | grep -q 'k="scope" t="nonlocal"' && printf
 #    every time, so its cost grew with the cube of the nesting: 2,000 chained `if (x)` took 48 s and 4,000 did not
 #    finish in two minutes (an MCP `slice` call on such a file wedged the server). It now reads parents from a table
 #    built in one cursor pass and memoizes the anchor, so it is linear; the only bound left is a STACK guard at 2,048
-#    syntax levels, because the walks still recurse once per level on the main thread.
+#    syntax levels, because the walks still recurse once per level. Past 256 levels they recurse on a 64 MB stack of
+#    their own: an ASan frame is ~10x a plain one, and 2,040 nested loops need 18.6 MB under ASan, which no caller's
+#    8 MB main stack carries (walked on the main thread, this gate's (a) and (b) aborted under ASan with a
+#    stack-overflow report; nested loops overflowed it past ~880 levels).
 #    (a) 2,000 nested ifs are ANSWERED inside a 30 s bound (base: killed).
-#    (b) 2,040 nested `for` loops — the deepest per-level stack shape measured (~870 B a level on plain arm64) — are
-#        ANSWERED just under the guard, so the guard is proven safe for its worst admitted input on the build under test
-#        (run this gate with RIPWIRE_BIN=asan/ripwire to prove it for the wider sanitizer frames).
+#    (b) 2,040 nested `for` loops — the widest stack per level measured (~870 B plain, ~9.2 KB under ASan) — are
+#        ANSWERED just under the guard with the CALLER's stack held to 1 MB, so the walk provably runs on its own stack,
+#        not the caller's (base: SIGSEGV at 1 MB on a plain build). Run this gate with RIPWIRE_BIN=asan/ripwire to prove
+#        the own stack carries the sanitizer frames too.
 #    (c) a CPython-shaped chained assignment ~808 levels deep — Lib/test/test_traceback.py:3256, the deepest function in
 #        47,795 parsed files — is ANSWERED: a real file must never meet the guard.
 #    (d) 6,000 nested blocks are REFUSED by name, in bounded time, before any walk.
@@ -440,10 +444,10 @@ bounded(){ if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else per
 [ "$rc15" -eq 0 ] && grep -q '<s l="4"' "$DEEPDIR/deep.out" \
     && ok "(15a) deep:y — 2,000 nested ifs slice in bounded time (exit 0, the assignment row at l=4)" \
     || no "(15a) deep:y exit $rc15 (expected 0 with the l=4 row; 124/142 is the cubic walk, 1 a guard set below real depth): $( head -c 200 "$DEEPDIR/deep.err" )"
-( cd "$DEEPDIR" && bounded "$BIN" . --slice=loops:y --no-cache >"$DEEPDIR/loops.out" 2>"$DEEPDIR/loops.err" ); rc15l=$?
+( cd "$DEEPDIR" && ulimit -s 1024 && bounded "$BIN" . --slice=loops:y --no-cache >"$DEEPDIR/loops.out" 2>"$DEEPDIR/loops.err" ); rc15l=$?
 [ "$rc15l" -eq 0 ] && grep -q '<s l="10"' "$DEEPDIR/loops.out" \
-    && ok "(15b) loops:y — 2,040 nested for loops (the widest stack per level) slice just under the guard (exit 0, the assignment row at l=10)" \
-    || no "(15b) loops:y exit $rc15l (expected 0; 139/138 is the recursion overflowing the stack below the guard): $( head -c 200 "$DEEPDIR/loops.err" )"
+    && ok "(15b) loops:y — 2,040 nested for loops (the widest stack per level) slice just under the guard on a 1 MB caller stack (exit 0, the assignment row at l=10)" \
+    || no "(15b) loops:y exit $rc15l (expected 0; 139/138/134 is the recursion overflowing a stack below the guard — the caller's, or its own): $( head -c 200 "$DEEPDIR/loops.err" )"
 ( cd "$DEEPDIR" && bounded "$BIN" . --slice=chained:a1 --no-cache >"$DEEPDIR/chain.out" 2>"$DEEPDIR/chain.err" ); rc15b=$?
 [ "$rc15b" -eq 0 ] && grep -q '<s l="2"' "$DEEPDIR/chain.out" \
     && ok "(15c) chained:a1 — an 806-name, ~808-level chained assignment (CPython test_traceback.py's shape) is answered" \

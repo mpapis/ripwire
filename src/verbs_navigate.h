@@ -1247,10 +1247,9 @@ std::optional<int> runSlice( const MainDispatch& d )
 
     const ::TSLanguage* grammar = sliceGrammarForFile( path );
     slicev::SliceScan   scan    = slicev::sliceScanDefinition( src, sym, fam, grammar, varName );   // re-scanned below on a seed pre-pick
-    if( scan.tooDeep )
+    if( const std::string refusal = slicev::sliceScanRefusal( scan, sym.name, path ); !refusal.empty() )
     {
-        rw::emitTo( stderr, "ripwire: --slice: {} in {} nests deeper than {} syntax levels — refused: the slice walks recurse once per "
-                              "level, and a definition this deep would exhaust the stack\n", sym.name, path, slicev::kMaxSliceDepth );
+        rw::emitTo( stderr, "ripwire: --slice: {}\n", refusal );
         return 1;
     }
     if( !scan.parseOk )
@@ -1314,6 +1313,11 @@ std::optional<int> runSlice( const MainDispatch& d )
             varName              = pickedVar;
             seedInfo.varFromSeed = true;
             scan                 = slicev::sliceScanDefinition( src, sym, fam, grammar, varName );   // the same scan a :VAR spec runs
+            if( const std::string refusal = slicev::sliceScanRefusal( scan, sym.name, path ); !refusal.empty() )
+            {
+                rw::emitTo( stderr, "ripwire: --slice: {}\n", refusal );
+                return 1;
+            }
         }
     }
 

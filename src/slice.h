@@ -62,7 +62,10 @@
 
 #include <tree_sitter/api.h>
 
+#include <pthread.h>   // pthread_attr_setstacksize — a deep definition walks on a stack sized for the guard (sliceRunOnOwnStack)
+
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <iterator>    // std::size — the kOccTagNames extent
 #include <cstring>
@@ -305,6 +308,7 @@ struct SliceScan
 {
     bool                       parseOk = false;   // grammar present + file parsed + span located
     bool                       tooDeep = false;   // parsed, but the definition nests past kMaxSliceDepth — refused, never walked
+    int                        walkThreadError = 0;   // parsed and under the guard, but the deep walk's own thread did not start (the pthread error) — refused, never walked
     std::vector<SliceOcc>      occ;               // VAR-mode occurrences, source order (empty when var empty)
     std::vector<SliceLocal>    locals;            // the sliceable-locals NAMES, first-def order (refusal text, seed pick)
     std::vector<SliceBinding>  bindings;          // the sliceable-locals inventory, one per VARIABLE (a shadowed name lists twice)
@@ -2075,13 +2079,61 @@ inline void sliceComputeReach( SliceScan& scan, TSNode root, const SliceWalkCtx&
 // The deepest syntax-tree nesting a definition may reach before the slice refuses it. This is a STACK guard, not a time
 // guard: with the parent table and the memoized statement anchor the walk is linear in the nesting (measured on a
 // plain build: 2,000 / 4,000 / 8,000 nested ifs in 0.05 / 0.06 / 0.08 s, where the parent-climbing walk took 48 s at
-// 2,000 and did not finish at 4,000), but the walks still recurse once per level on the calling thread, and every
-// slice path (CLI and MCP) runs on the main thread's ~8 MB stack. The worst measured shape per level is nested loops:
-// ~4,085 nested for/while needed 3,660 KB on a plain arm64 build (~870 B a level), ifs 2,012 KB, blocks 1,362 KB, and a
-// sanitizer build's frames are 2-3x wider. 2,048 levels keeps the worst shape near 1.8 MB plain, inside 8 MB under
-// ASan with margin, and is still 2.5x the deepest function measured in 47,795 parsed files across 90 repositories
-// (808 levels, a CPython chained assignment).
+// 2,000 and did not finish at 4,000), but the walks still recurse once per level. Stack per syntax level, measured by
+// bisecting the stack over 2,040-level shapes: nested for/while/do ~875 B on a plain arm64 build and ~9.1 KB under
+// ASan (18.6 MB for 2,040), ifs ~6.8 KB, else-if chains ~4.1 KB, blocks ~1.6 KB, switches ~0.6 KB. A sanitizer frame
+// is ~10x a plain one, so the caller's 8 MB main stack cannot carry the guard's worst shape under ASan (nested loops
+// overflowed it past ~880 levels); a definition deeper than kSliceCallerStackDepth therefore walks on a thread of its
+// own with kSliceWalkStackBytes of stack — 3.5x the worst ASan need at the guard, 36x the plain one. 2,048 is still
+// 2.5x the deepest function measured in 47,795 parsed files across 90 repositories (808 levels, a CPython chained
+// assignment).
 inline constexpr std::uint32_t kMaxSliceDepth = 2048;
+
+// Up to this nesting the walk stays on the calling thread — at most ~225 KB of its stack on a plain build and ~2.3 MB
+// under ASan, whatever the shape — so nearly every real definition starts no thread. Deeper ones walk on their own.
+inline constexpr std::uint32_t kSliceCallerStackDepth = 256;
+
+// The deep walk's stack: address space reserved for the guard's worst shape with margin, touched only as deep as the
+// walk actually goes.
+inline constexpr std::size_t kSliceWalkStackBytes = std::size_t( 64 ) << 20;
+
+// Runs body() to completion on a joined thread with `stackBytes` of stack. Returns 0, or the pthread error when no such
+// thread could be started — body() then did not run. The caller waits in the join, so body() reads and writes the
+// caller's state exactly as a direct call would.
+template<class Body>
+[[nodiscard]] inline int sliceRunOnOwnStack( std::size_t stackBytes, Body& body ) noexcept
+{
+    pthread_attr_t attr;
+    if( const int initError = pthread_attr_init( &attr ); initError != 0 )
+    {
+        return initError;
+    }
+    struct AttrOwner
+    {
+        pthread_attr_t* owned;
+        ~AttrOwner()
+        {
+            pthread_attr_destroy( owned );
+        }
+    };
+    const AttrOwner attrOwner{ &attr };
+    if( const int sizeError = pthread_attr_setstacksize( &attr, stackBytes ); sizeError != 0 )
+    {
+        return sizeError;
+    }
+    const auto trampoline = []( void* arg ) noexcept -> void*
+    {
+        ( *static_cast<Body*>( arg ) )();
+        return nullptr;
+    };
+    pthread_t thread;
+    if( const int startError = pthread_create( &thread, &attr, trampoline, &body ); startError != 0 )
+    {
+        return startError;
+    }
+    pthread_join( thread, nullptr );   // a joinable thread this call started, joined once from another thread: cannot fail
+    return 0;
+}
 
 // One cursor pass over the nodes overlapping [spanStart, spanEnd) and their ancestors: every visited node's parent,
 // and the deepest overlapping node's depth. The ancestor chain is an explicit vector, so the pass cannot recurse.
@@ -2125,7 +2177,7 @@ inline SliceParentIndex sliceBuildParentIndex( TSNode root, std::uint32_t spanSt
 
 // parse + walk. `src` is the WHOLE file (symbol byte offsets are file-absolute). parseOk=false means
 // the grammar refused or the span is out of range — the caller refuses loudly, never emits an empty
-// success. tooDeep=true (with parseOk=false) means the definition nests past kMaxSliceDepth.
+// success. tooDeep=true or walkThreadError!=0 (with parseOk=false) means the walk never ran — sliceScanRefusal words it.
 inline SliceScan sliceScanDefinition( const std::string& src, const Symbol& sym, SliceFam fam,
                                       const ::TSLanguage* grammar, std::string_view varName )
 {
@@ -2162,7 +2214,8 @@ inline SliceScan sliceScanDefinition( const std::string& src, const Symbol& sym,
     ctx.lang      = sym.lang;
     ctx.src       = src;
     ctx.selfName  = sym.name;
-    const SliceParentIndex parents = sliceBuildParentIndex( ts_tree_root_node( tree ), ctx.spanStart, ctx.spanEnd );
+    const TSNode           root    = ts_tree_root_node( tree );
+    const SliceParentIndex parents = sliceBuildParentIndex( root, ctx.spanStart, ctx.spanEnd );
     if( parents.deepest > kMaxSliceDepth )
     {
         scan.tooDeep = true;
@@ -2170,10 +2223,25 @@ inline SliceScan sliceScanDefinition( const std::string& src, const Symbol& sym,
         ts_parser_delete( parser );
         return scan;
     }
-    const SliceParentIndexScope parentScope( parents );
-    sliceWalk( ts_tree_root_node( tree ), ctx, scan, SlicePp::Live );
-    sliceResolveBindings( scan );
-    sliceComputeReach( scan, ts_tree_root_node( tree ), ctx );   // rung 3: needs the bindings resolved and the tree still alive
+    auto walk = [ &parents, root, &ctx, &scan ]() noexcept
+    {
+        const SliceParentIndexScope parentScope( parents );   // thread-local: installed on whichever thread walks
+        sliceWalk( root, ctx, scan, SlicePp::Live );
+        sliceResolveBindings( scan );
+        sliceComputeReach( scan, root, ctx );   // rung 3: needs the bindings resolved and the tree still alive
+    };
+    if( parents.deepest <= kSliceCallerStackDepth )
+    {
+        walk();
+    }
+    else if( const int threadError = sliceRunOnOwnStack( kSliceWalkStackBytes, walk ); threadError != 0 )
+    {
+        DEGRADED_PATH_ALERT( "slice: the deep definition's walk thread did not start" );
+        scan.walkThreadError = threadError;
+        ts_tree_delete( tree );
+        ts_parser_delete( parser );
+        return scan;
+    }
     for( const SliceNamedOcc& no : scan.all )
     {
         if( !varName.empty() && no.name == varName )
@@ -2186,6 +2254,25 @@ inline SliceScan sliceScanDefinition( const std::string& src, const Symbol& sym,
     ts_tree_delete( tree );
     ts_parser_delete( parser );
     return scan;
+}
+
+// The refusal for a scan whose walk never ran, or "" when there is none. One wording for the CLI and MCP surfaces, and for
+// the seed pick's re-scan too: a deep walk's thread can fail to start on the second scan after the first one ran.
+inline std::string sliceScanRefusal( const SliceScan& scan, std::string_view name, std::string_view path )
+{
+    const std::string subject = "'" + std::string( name ) + "' in " + std::string( path );
+    if( scan.tooDeep )
+    {
+        return subject + " nests deeper than " + std::to_string( kMaxSliceDepth ) + " syntax levels — refused: the slice walks recurse once "
+               "per level, and a definition this deep would exhaust the stack";
+    }
+    if( scan.walkThreadError != 0 )
+    {
+        return subject + " nests deeper than " + std::to_string( kSliceCallerStackDepth ) + " syntax levels, so the slice walks it on a stack "
+               "of its own, and that thread did not start (" + std::strerror( scan.walkThreadError ) + ") — refused rather than walked on a "
+               "stack it could overflow";
+    }
+    return {};
 }
 
 // ── rung 2: the cross-statement data-flow slice (lane/or-arise) ─────────────────────────────────────
