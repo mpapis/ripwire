@@ -34,8 +34,8 @@ fragment). They are indexed as text; nothing here executes at gate time.
 | `--uses=id` | defs=14 external=0 count=1 | the multi-def floor: EVERY table carries its key (12 implicit, `id: :uuid`, and the explicit `id: false`-less ones); only `id: false` + the renamed table have none |
 | `--uses=created_at` | defs=2 | the rendered `t.datetime "created_at"` column AND the literal `t.timestamps` call |
 | `--uses=event_id` | defs=1 | `primary_key: "event_id"` renames the key off `id` |
-| `--callers=created_at` | count=1 | `Timestamps.new.created_at` reaches BOTH defs — the Lang::Ruby admission consequence |
-| `graph_ambiguous` | 4 on `name` | the rich/new/rec receiver sites split; `self.name` in PairDefColumn pins (0) |
+| `--callers=created_at` | defs=2 count=0 | DEFINITIONS ONLY: the call site matches both defs but columns carry NO call edges (§3) |
+| `graph_ambiguous` | 2 on `name` | only the sites that still split over real method/attr defs; the column sites exited the gauge when edges were switched off (§4) |
 
 ## Stated floors (silence is stated, never silent)
 

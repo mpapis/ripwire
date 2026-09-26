@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# rubyschemacheck.sh — parser version 122 gate: RUBY db/schema.rb COLUMNS ARE Section DEFS. The Rails
-# schema capture: a Ruby file whose tree holds a `create_table "x", … do |t| … end` call is a rendered
-# schema BY CONTENT (no path heuristic), and each `t.<type> "name"` / `t.<type> :name` receiver-call in
+# rubyschemacheck.sh — the Rails schema capture gate: RUBY db/schema.rb COLUMNS ARE Section DEFS. A
+# Ruby file whose tree holds a `create_table "x", … do |t| … end` call is a rendered schema BY CONTENT
+# (no path heuristic), and each `t.<type> "name"` / `t.<type> :name` receiver-call in
 # the table block mints ONE SymKind::Section def at Lang::Ruby — the same data-kind slot as a doc
 # heading / YAML key (model.h) — with span = the name token. Rails-generated attribute uses
-# (`product.price`, pinned here as explicit-receiver model calls) then bind to the column def set and
-# reach the call graph and PageRank: the "admission consequence" the PR body discloses. The DSL CALLS
-# keep their reference posture exactly like the attr family (--uses=string/define/timestamps stay
-# defs=0 external=1). The four id spellings and t.timestamps name columns too, per the rules below.
+# (`product.price`, pinned here as explicit-receiver model calls) resolve to the column as a def —
+# DEFINITIONS ONLY by maintainer decision: the defs answer --uses/--grep/--whereis but admit NO call
+# edges and no PageRank weight (graph.h buildGraph's byName skips Section-Ruby; §3 pins that). The DSL
+# CALLS keep their reference posture exactly like the attr family (--uses=string/define/timestamps
+# stay defs=0 external=1). The four id spellings and t.timestamps name columns too, per the rules
+# below; a composite/symbol primary_key mints no implicit id.
 #
 # Fixture test/rubyschemafix — schema text from a real, running Rails 8.1 app's `bin/rails
 # db:schema:dump` (verified db:schema:load-able), with the original domain tables scrubbed to spike_*
@@ -26,7 +28,7 @@
 #   migration_string/migration_symbol/migration_columns  the migration INTERFERENCE floors: a
 #     class-wrapped create_table (string- OR symbol-named) mints NOTHING — the schema is the only
 #     source of column names, indexing a migration beside its schema would double every def and its
-#     PageRank weight — and add_column/remove_column are argument data, never defs (a column added
+#     — and add_column/remove_column are argument data, never defs (a column added
 #     then dropped never registers)
 #   floor_case      where("name = ?") — a string fragment stays opaque, never a def or a use
 #   all_four / pair_def_column / triple_*  the def+attr+column(+yaml) collision matrix; the picker
@@ -74,6 +76,15 @@ callershead(){ "$BIN" "$FIX" --callers="$1" --no-cache 2>/dev/null | grep -oE "o
 [ "$( useshead updated_at )"  = 'of="updated_at" defs="2" external="0" count="0"' ] \
     && ok 'capture: updated_at — both spellings def; no consumer calls it (floor proof the count is per-row, not padded)' \
     || no "capture: updated_at: $( useshead updated_at )"
+[ "$( useshead origin )"      = 'of="origin" defs="1" external="0" count="0"' ] \
+    && ok 'capture: a COMPOSITE primary_key (["origin","destination"]) mints the rendered columns — and NO implicit id (the id defs=14 arm above is the regression guard)' \
+    || no "capture: origin: $( useshead origin )"
+[ "$( useshead destination )" = 'of="destination" defs="1" external="0" count="0"' ] \
+    && ok 'capture: the composite key'"'"'s second column mints too' \
+    || no "capture: destination: $( useshead destination )"
+undefinable 'price > 0' \
+    && ok "floor: t.check_constraint \"price > 0\", name: … — a constraint EXPRESSION names no column (would otherwise mint n=\"price > 0\")" \
+    || no 'floor: price > 0 — a check_constraint expression minted a def'
 
 # ── 2. FLOORS: the DSL calls stay references; non-column DSL names no column ───────────────────────
 undefinable owner \
@@ -103,22 +114,25 @@ for dsl in string define datetime timestamps create_table; do
         || no "posture: $dsl gained a def — the DSL call must stay a reference: $( useshead "$dsl" )"
 done
 
-# ── 3. BINDING: model call sites reach the column def set (the admission consequence) ───────────────
+# ── 3. DEFINITIONS ONLY: columns admit NO call edges (maintainer decision, graph.h buildGraph byName) ──
+[ "$( callershead id )"         = 'of="id" defs="14" count="0"' ] \
+    && ok 'defs-only: `IdDefault.new.id` matches the 14 defs but has NO caller row — columns take no edges' \
+    || no "defs-only: id callers: $( callershead id )"
+[ "$( callershead created_at )" = 'of="created_at" defs="2" count="0"' ] \
+    && ok 'defs-only: `Timestamps.new.created_at` matches both defs but carries no call edge' \
+    || no "defs-only: created_at callers: $( callershead created_at )"
+[ "$( callershead ref )"        = 'of="ref" defs="1" count="0"' ] \
+    && ok "defs-only false-binding: a COLUMN-ONLY name (ref) gains no caller from an unrelated 'obj.ref' style site — pre-change it did bind (untyped receivers)" \
+    || no "defs-only: ref callers: $( callershead ref )"
 [ "$( callershead name )"       = 'of="name" defs="19" count="3"' ] \
-    && ok 'bind: the 3 name call sites reach the 19-def set — columns admit call edges (the Lang::Ruby admission)' \
-    || no "bind: name callers: $( callershead name )"
-[ "$( callershead id )"         = 'of="id" defs="14" count="1"' ] \
-    && ok 'bind: `IdDefault.new.id` sits on the 14-table implicit-id def set' \
-    || no "bind: id callers: $( callershead id )"
-[ "$( callershead created_at )" = 'of="created_at" defs="2" count="1"' ] \
-    && ok 'bind: `Timestamps.new.created_at` reaches BOTH created_at defs (rendered column + literal call)' \
-    || no "bind: created_at callers: $( callershead created_at )"
+    && ok 'defs-only: the 3 name caller rows come from the METHOD/attr defs only — the 9 columns contribute zero edges to the 19-def set' \
+    || no "defs-only: name callers: $( callershead name )"
 
 # ── 4. AMBIGUITY + LOCALITY: the resolver splits honestly, pins on evidence ─────────────────────────
 "$BIN" "$FIX" --uses=name --no-cache 2>/dev/null >"$TMP/uses_name"
 grep -q 'of="name" defs="19" external="0" count="3"' "$TMP/uses_name" \
-    && grep -q 'graph_ambiguous="4"' "$TMP/uses_name" \
-    && ok 'ambiguity: the name graph_ambiguous gauge counts exactly the 4 splitting sites (rich/new/rec receivers + id + created_at), never a silent pin' \
+    && grep -q 'graph_ambiguous="2"' "$TMP/uses_name" \
+    && ok 'ambiguity: the name gauge counts ONLY the 2 sites that still split over real (method/attr) defs — the id/created_at column sites left the gauge once columns stopped taking edges' \
     || no 'ambiguity: name gauge/rows wrong'
 grep -q 'p="consumer_ambiguous.rb:8"' "$TMP/uses_name" \
     && ok 'ambiguous arm: rec.name on a plain local SPLITS over the whole def set (its row is in the gauge)' \
@@ -126,9 +140,9 @@ grep -q 'p="consumer_ambiguous.rb:8"' "$TMP/uses_name" \
 grep -q 'p="pair_def_column.rb:15"' "$TMP/uses_name" \
     && ok 'locality arm: self.name inside PairDefColumn pins the in-class def — its row exists and is NOT in the ambiguous gauge' \
     || no 'locality arm: pair_def_column.rb:15 row missing'
-grep -q 'p="column_consumers.rb:6"' "$TMP/uses_name" \
+grep -q 'p="column_consumers.rb:7"' "$TMP/uses_name" \
     && ok 'binding arm: SingleColumn.new.name is a real use row (explicit model receiver)' \
-    || no 'binding arm: column_consumers.rb:6 row missing'
+    || no 'binding arm: column_consumers.rb:7 row missing'
 
 # ── 5. MAP KINDS: the defs carry t="sec" with the DSL row family merged by name ─────────────────────
 "$BIN" "$FIX" --no-cache 2>/dev/null >"$TMP/map"
@@ -152,6 +166,9 @@ grep -q '<s t="sec" n="id"' "$TMP/schema_block" \
 grep -q '<s t="sec" n="event_id"' "$TMP/schema_block" \
     && ok 'kind: the primary_key rename def is a Section row too' \
     || no 'kind: event_id section row missing'
+grep -q '<s t="sec" n="origin"' "$TMP/schema_block" && grep -q '<s t="sec" n="destination"' "$TMP/schema_block" \
+    && ok 'kind: the composite-key columns are Section rows' \
+    || no 'kind: origin/destination section rows missing'
 grep -q '<s t="method" n="name" sc="PairDefColumn"' "$TMP/map" && grep -q '<s t="sec" n="name"' "$TMP/schema_block" \
     && ok 'collision: the method def and the column def share the NAME, never the identity — both stand' \
     || no 'collision: method/column name defs lost one side'

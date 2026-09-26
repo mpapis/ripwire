@@ -1163,9 +1163,18 @@ inline void captureRubyAttrDefsCall( TSNode n, std::uint32_t fileId, std::string
     } );
 }
 
-inline void captureRubyAttrDefs( TSNode root, std::uint32_t fileId, std::string_view src, std::vector<RawDef>& defs )
+// ONE pre-order walk of the whole tree dispatching BOTH Ruby def-side lanes — the class-level
+// attribute DSL and the rendered-schema column capture — from the same explicit stack (the duplication
+// the maintainer's quality-delta flagged: two byte-identical walkers). The per-file signals (contains
+// "attr" / contains "create_table") decide which dispatch fires before the walk starts, exactly like
+// each lane's former early-out. Everything else in each lane is unchanged.
+// The schema table helper is defined with its lane below (this walker lives with the attr lane).
+inline void rubySchemaTableCall( TSNode n, std::uint32_t fileId, std::string_view src, std::vector<RawDef>& defs );
+inline void captureRubyDefs( TSNode root, std::uint32_t fileId, std::string_view src, std::vector<RawDef>& defs )
 {
-    if( src.find( "attr" ) == std::string_view::npos )   // file signal: every family name contains "attr"
+    const bool wantAttr   = src.find( "attr" ) != std::string_view::npos;          // every family name contains "attr"
+    const bool wantSchema = src.find( "create_table" ) != std::string_view::npos;  // the schema gate name must appear
+    if( !wantAttr && !wantSchema )
     {
         return;
     }
@@ -1185,10 +1194,17 @@ inline void captureRubyAttrDefs( TSNode root, std::uint32_t fileId, std::string_
         stack.pop_back();
         if( kindIs( ts_node_type( n ), "call" ) )
         {
-            const std::string_view fam = rubyNamedDirective( n, src, kRubyAttrFamilyNames );
-            if( !fam.empty() && rubyAttrAtClassBodyLevel( n, src ) )
+            if( wantAttr )
             {
-                captureRubyAttrDefsCall( n, fileId, src, fam, defs );
+                const std::string_view fam = rubyNamedDirective( n, src, kRubyAttrFamilyNames );
+                if( !fam.empty() && rubyAttrAtClassBodyLevel( n, src ) )
+                {
+                    captureRubyAttrDefsCall( n, fileId, src, fam, defs );
+                }
+            }
+            if( wantSchema && fieldIdentifierText( n, NodeField::Method, src ) == "create_table" )
+            {
+                rubySchemaTableCall( n, fileId, src, defs );
             }
         }
         collectChildren( n, cursor.cur, kids );
@@ -1200,15 +1216,18 @@ inline void captureRubyAttrDefs( TSNode root, std::uint32_t fileId, std::string_
 }
 
 
-// ─── parser version 122 (test/rubyschemacheck.sh): RUBY db/schema.rb COLUMNS ARE Section DEFS ───
+// ─── the Rails schema capture (test/rubyschemacheck.sh): RUBY db/schema.rb COLUMNS ARE Section DEFS ───
 // A schema file is recognized BY CONTENT, never by path: any Ruby file whose tree holds a
 // `create_table "x", … do |t| … end` call — the call's `block:` field is a do_block whose `parameters:`
 // field is a block_parameters carrying ONE bare identifier — is a rendered-schema document (the block
 // is the create_table call's OWN do_block, found by named-child kind because the shared NodeField set
-// has no Block enumerator). Path plays no part: a schema dumped inside `ActiveRecord::Schema[8.1]
-// .define … do`, a migration's class-level table, or a plain top-level one all look identical to this
-// walk — the container does not matter. The file signal below is a contains-"create_table" reject like
-// the attribute-family capture's contains-"attr" reject; the semantic gate is the AST shape.
+// has no Block enumerator). Path plays no part: a rendered dump sits at file level or under
+// `ActiveRecord::Schema[].define … do`. WHAT A WALK OF THE FILE IS NOT: a MIGRATION wraps its
+// create_table inside a class/module body, and rubySchemaTableCall's Gate 0 refuses every
+// class/module-nested table — so the container DOES matter exactly there (the migration shape
+// contributes ZERO defs, pinned by the three migration fixtures). The file signal below is a
+// contains-"create_table" reject like the attribute-family capture's contains-"attr" reject; the
+// semantic gate is the AST shape.
 //
 // Each `t.<type> "name"` / `t.<type> :name` receiver-CALL in the table's do-block body mints ONE
 // SymKind::Section def at Lang::Ruby — the same data-kind slot as a YAML key / doc heading (model.h;
@@ -1236,11 +1255,11 @@ inline void captureRubyAttrDefs( TSNode root, std::uint32_t fileId, std::string_
 //     instead of the implicit `id`
 // Duplicate column NAMES across tables stay SEPARATE defs (distinct nameByte identities — the dedup
 // ladder only folds same-byte captures).
-inline constexpr std::array<std::string_view, 4> kRubySchemaNonColumns = { "index", "references", "belongs_to", "polymorphic" };
+inline constexpr std::array<std::string_view, 7> kRubySchemaNonColumns = { "index", "references", "belongs_to", "polymorphic", "check_constraint", "exclusion_constraint", "unique_constraint" };
 
 // The FIRST non-comment named child of an argument_list — the attribute-DSL comment posture ("attribute( # note
 // then :x"): a comment is an n-ary extra, never an argument. Null when the list is all comments/empty.
-inline TSNode rubyFirstNonCommentArg( TSNode args, std::string_view /*src*/ ) noexcept
+inline TSNode rubyFirstNonCommentArg( TSNode args ) noexcept
 {
     ChildCursor cursor( args );
     TSNode      first{};
@@ -1313,7 +1332,7 @@ inline void rubySchemaColumnCall( TSNode c, std::uint32_t fileId, std::string_vi
     {
         return;
     }
-    const TSNode nameNode = rubyFirstNonCommentArg( args, src );
+    const TSNode nameNode = rubyFirstNonCommentArg( args );
     if( ts_node_is_null( nameNode ) )
     {
         return;
@@ -1374,7 +1393,7 @@ inline void rubySchemaTableCall( TSNode n, std::uint32_t fileId, std::string_vie
     }
     // Gate 1: a STRING table name as the first argument (a symbol-named table is a migration spelling,
     // not a rendered-schema shape — stated floor; no name node → no schema surface either).
-    const TSNode tableName = rubyFirstNonCommentArg( args, src );
+    const TSNode tableName = rubyFirstNonCommentArg( args );
     if( ts_node_is_null( tableName ) || !kindIs( ts_node_type( tableName ), "string" ) )
     {
         return;
@@ -1486,6 +1505,13 @@ inline void rubySchemaTableCall( TSNode n, std::uint32_t fileId, std::string_vie
         defs.push_back( d );
         return;
     }
+    // A primary_key pair with a NON-string value (composite `["a","b"]`, hand-written `:symbol`): the
+    // key is NOT an `id` and the rendered columns are the block's own explicit `t.<type>` lines (already
+    // minted above) — suppress the implicit id entirely (the composite case is pinned by the fixture).
+    if( primaryKey )
+    {
+        return;
+    }
     // Implicit `id` — anchored at the table-name string's content start (a stable per-table byte).
     {
         const std::uint32_t s = ts_node_start_byte( tableName ), e = ts_node_end_byte( tableName );
@@ -1496,40 +1522,7 @@ inline void rubySchemaTableCall( TSNode n, std::uint32_t fileId, std::string_vie
     }
 }
 
-// The schema walk: ONE pass over the whole tree (the same explicit-stack shape as captureRubyAttrDefs —
-// root's width is file-controlled, never index it, O(C²)). Every create_table-with-handle call in the
-// file mints its table's defs; anything that is not such a call contributes nothing.
-inline void captureRubySchemaDefs( TSNode root, std::uint32_t fileId, std::string_view src, std::vector<RawDef>& defs )
-{
-    if( src.find( "create_table" ) == std::string_view::npos )   // file signal: the gate name must appear
-    {
-        return;
-    }
-    ChildCursor         cursor( root );
-    std::vector<TSNode> kids;
-    kids.reserve( 64 );
-    std::vector<TSNode> stack;
-    stack.reserve( 64 );
-    collectChildren( root, cursor.cur, kids );   // root's width is file-controlled — never index it (O(C²))
-    for( std::size_t i = kids.size(); i > 0; --i )
-    {
-        stack.push_back( kids[i - 1] );
-    }
-    while( !stack.empty() )
-    {
-        const TSNode n = stack.back();
-        stack.pop_back();
-        if( kindIs( ts_node_type( n ), "call" ) && fieldIdentifierText( n, NodeField::Method, src ) == "create_table" )
-        {
-            rubySchemaTableCall( n, fileId, src, defs );
-        }
-        collectChildren( n, cursor.cur, kids );
-        for( std::size_t i = kids.size(); i > 0; --i )
-        {
-            stack.push_back( kids[i - 1] );
-        }
-    }
-}
+
 
 // F5: a Swift LOCAL binding — `let a = f()` / `var b = ...` inside a function/closure body — parses to the
 // same `property_declaration` node as a real stored/computed MEMBER property, so the @definition.var pattern

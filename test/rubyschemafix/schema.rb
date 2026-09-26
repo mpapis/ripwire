@@ -52,7 +52,7 @@ ActiveRecord::Schema[8.1].define(version: 2000_01_01_000001) do
   end
 
   create_table "spike_quote_single", force: :cascade do |t|
-    t.string "name"
+    t.string 'name'
   end
 
 create_table "spike_quote_symbol", force: :cascade do |t|
@@ -60,6 +60,12 @@ create_table "spike_quote_symbol", force: :cascade do |t|
     t.references :owner
     t.index ["name"], name: "idx_spike"
     helper.string "unbound_column"
+    t.check_constraint "price > 0", name: "check_positive"
+  end
+
+  create_table "spike_composite_keys", primary_key: ["origin", "destination"], force: :cascade do |t|
+    t.string "origin"
+    t.string "destination"
   end
 
   create_table "spike_single_columns", force: :cascade do |t|
