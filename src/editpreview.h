@@ -202,6 +202,10 @@ inline IngestResult previewMerge( const IngestResult& ing, std::uint32_t fileId,
         c.id     = NodeId( out.symbols.size() );
         out.symbols.push_back( std::move( c ) );
     }
+    // the function-local scope side table (model.h fnLocalScopes): ascending id, spliced at the same seam
+    for( const FnLocalScope& f : ing.fnLocalScopes ) { if( f.id < lo ) { out.fnLocalScopes.push_back( f ); } }
+    for( FnLocalScope f : one.fnLocalScopes )         { f.id = NodeId( lo + f.id ); out.fnLocalScopes.push_back( f ); }
+    for( FnLocalScope f : ing.fnLocalScopes )         { if( f.id >= hi ) { f.id = shift( f.id ); out.fnLocalScopes.push_back( f ); } }
 
     // The field SIDE TABLE keeps its own index space (a FieldId, never a NodeId), so it is spliced by the
     // same (fileId, …) ordering and its ids are simply re-indexed.
@@ -454,7 +458,8 @@ inline Outcome run( const IngestResult& ing, const Graph& g, const std::string& 
     // differently from the answer it predicts would be worth nothing (test/editpreviewcheck.sh compares
     // the two documents).
     oc.xml = editCheckBundleText( merged, mg, root, maxFileBytes, excludes, groups[0].lowestNode, ni, true,
-                                   pageLimit, pageOffset, previewUnprovenDefs );
+                                   pageLimit, pageOffset, previewUnprovenDefs, /*notesDegraded=*/false,
+                                   EditCheckSpliced{ newBytes, fsym.fileId, true } );   // the merged spans index the spliced bytes
     // E3 (terminality round A, 2026-09-05): the CURRENT span an apply would replace, as the bytes are on disk, so
     // the Read an agent makes before an edit "to see what I am about to overwrite" is already in the preview.
     // Appended as the last child of the preview's own root — the post-hoc document cannot carry it (after the

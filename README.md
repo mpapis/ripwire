@@ -12,7 +12,7 @@
 **The ripgrep of AI context. A map before your agent reads the repo — and a check on what it writes.**
 
 Ranked, deterministic call graph: what to touch, what it breaks, which tests to run. On the edit: blast
-radius, tests that reach it, ten quality kinds reporting only what got worse, forgotten co-changes, fields
+radius, tests that reach it, eleven quality kinds reporting only what got worse, forgotten co-changes, fields
 read and written, names that resolve more than one way.
 
 **Just want to use it?** Install it with the one line below, then start each coding session by telling your agent to
@@ -23,6 +23,91 @@ when to reach for each command.
 format, exit codes and limits. You do not need it to get started.
 
 <p align="center"><a href="https://trendshift.io/repositories/217924?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-217924"><img src="https://trendshift.io/api/badge/trendshift/repositories/217924/weekly?language=C%2B%2B" alt="Trendshift: C++ Repository of the Week badge for redhat-et/ripwire" width="250" height="55"></a></p>
+
+<details>
+<summary><b>Field report: what ripwire contributed to a large multi-agent coding engagement</b> — written by Claude Fable 5.0, the frontier model orchestrating ~20 coding agents over two days on a ~1,500-file C++/Metal codebase. Click for the full report.</summary>
+
+> For a single developer, this tool is a good lookup accelerator. For an *orchestrated fleet*, it's load-bearing: it
+> halved the research spend, twice redirected tasks before wasted work, prevented at least one silent-divergence shipped
+> bug, and turned code-quality hygiene from a hope into a per-task mechanical gate. Whole-workflow ~2×; per-lookup
+> 10–25×; and two moments where one call was worth more than the rest of the session's tooling combined.
+>
+> — the report's bottom line
+
+<p align="center"><a href="docs/assets/field-report-multi-agent.jpg"><img src="docs/assets/field-report-multi-agent.jpg"
+  alt="The full field report: what ripwire contributed to a large multi-agent coding engagement — headline numbers, where the value concentrated, the honest boundary, and the bottom line" width="720"></a></p>
+
+<details>
+<summary>Text version of the report</summary>
+
+**Field report: what ripwire contributed to a large multi-agent coding engagement**
+
+*Context, genericized: one orchestrating session directing ~20 sequential/parallel coding agents over a ~1,500-file
+C++/Metal codebase across two days — a deep architecture audit, then a 14-task feature wave (new subsystems,
+measurement infrastructure, a search-archive migration), ending in a verified all-on release flip. Every agent was
+instructed to lead with ripwire for orientation and to close with its quality gates.*
+
+**The headline numbers**
+
+- **Roughly half the total token spend of the audit/research phase, saved.** This is the operator's whole-phase
+  estimate — it includes everything the research agents did, ordinary file reads and all, which makes it conservative
+  rather than cherry-picked. The per-call factors underneath are much steeper: a single doc-recall call served the
+  relevant sections of a 164KB planning document in ~6K tokens (~25×), and agents that led with the tool ran ~30–40%
+  leaner on tool-call counts than agents doing raw read fan-outs over comparable questions.
+- **Two tasks had their direction changed by a single call.** One task was chartered to activate a steering behavior
+  the team believed was in production; one `--callers` query returned **zero production callers**, redirecting the
+  task to the real gap (the data provider that behavior needed had never been wired anywhere). Another task
+  refactored a widely-shared computation; `--edit-check` flagged **5 of 6 call sites** as incompatible — sites a text
+  search had missed — that would otherwise have silently diverged from the canonical path the day the feature was
+  enabled, surfacing months later as an unexplainable visual bug.
+- **A dozen-plus real code-quality defects fixed, not waived, across ~15 implementing agents** — all caught by
+  `--quality-delta` at each agent's "I think I'm done" moment: a 480-token duplicated routine, a fourth private copy of
+  a shared RNG utility, a hand-duplicated cost function, a pair of near-identical functions with a flipped sign
+  (correct at one boundary, quietly wrong at the other), test-fixture duplication across sibling suites, and functions
+  that had quietly absorbed a second job. None of these would have failed a test; all of them are the sediment that
+  rots a codebase under high-velocity multi-agent development. The gate made removing them routine instead of heroic.
+
+**Where the value concentrated**
+
+1. **Orientation and recall (the token win).** Ranked-signature task orientation and section-granular document recall
+   meant agents started from *answers*, not file dumps. Recall over planning docs was the orchestrator's single
+   most-used verb — the audit's entire framing came from two calls.
+2. **The contract checker (the shipped-bug preventions).** Beyond the 5-of-6 catch above, `--edit-check` gave
+   near-free proof-of-contract on every public-symbol change across the wave — the kind of verification that
+   otherwise simply doesn't happen at agent speed.
+3. **The quality gate as a *protocol*.** The measurable effect wasn't any single catch — it was that fifteen different
+   agents, none sharing context, all converged on the same "fix or justify with a written reason" discipline, with an
+   acknowledgments ledger that survived across tasks. Unattended orchestration usually leaks quality; here the
+   leak-check was mechanized.
+4. **Persistent notes.** Agents left gotcha notes pinned to symbols mid-wave (a caller-wiring law, an arming-rule
+   invariant), which later agents' lookups surfaced automatically — cheap institutional memory between contexts
+   that never met.
+
+**The honest boundary**
+
+- **The engagement's deepest findings did not come from the tool.** A structural capacity ceiling, a mis-derived
+  constant, a floating-point re-association drift of 1 ulp, and a seed-keying bug were all found by *bespoke
+  measurement the agents built* — baseline worktree diffs over full data fills, multi-arm attribution sweeps,
+  funnels. The tool is a floor for honesty and orientation, not a substitute for measurement design.
+- **Known false-positive mode, handled by its own documentation:** the contract checker's arity heuristic
+  over-counts on defaulted trailing parameters (one task saw "incompatible=18" that were all fine). The tool's own
+  trust-calibration notes say to verify by compiling in exactly this case, and agents that followed them lost nothing.
+- For broad, common-word conceptual queries, plain grep-and-read still occasionally won — consistent with the tool's
+  own guidance that it shines on specific technical asks.
+
+**Bottom line**
+
+For a single developer, this tool is a good lookup accelerator. For an *orchestrated fleet*, it's load-bearing: it
+halved the research spend, twice redirected tasks before wasted work, prevented at least one silent-divergence shipped
+bug, and turned code-quality hygiene from a hope into a per-task mechanical gate. Whole-workflow ~2×; per-lookup
+10–25×; and two moments where one call was worth more than the rest of the session's tooling combined.
+
+</details>
+
+*The model's own report of one engagement, on a version before 0.5; not a controlled measurement. Controlled
+measurements are in [docs/EVALS.md](docs/EVALS.md).*
+
+</details>
 
 <details>
 <summary><b>Fifty years of software-engineering results, and research from last month.</b> 49 repositories and 71 papers folded — McCabe (1976) through to <b>seven published in the last two months</b> — each row in <a href="docs/LINEAGE.md"><b>docs/LINEAGE.md</b></a> naming the lesson taken and the file it lives in</summary>
@@ -118,6 +203,25 @@ answer will not fit, it says it went over rather than silently dropping the row 
 Those two are the stair-steps: honest about what is missing, priced in what it spends. The step they
 climb toward is a question fully answered in one call, which is not always trivial to reach — and
 where it is not, the output says so rather than pretending otherwise.
+
+**How we measure the climb.** A complete answer to every code question is genuinely hard, and it is
+reached over many releases rather than in one. Until an answer can be complete, it owes you three
+things: it stays bounded in size, it is fully honest about what it does not know, and it gives you a
+clue where to look next. So every change is judged on more than "was it right":
+
+- **Complete answers:** the share of questions answered so you can act without re-checking.
+- **Honest-partial rate:** how often an incomplete answer says what it is missing, instead of
+  sounding confident.
+- **False-confidence rate:** wrong answers that claim to be complete — the worst case, held near zero.
+- **Next-clue usefulness:** for partial and wrong answers, whether following the answer's first
+  suggested next step reaches what the question needed, within one hop. Graded blind.
+
+**Answering comes first; efficiency is how we get there.** We aim for answers about as lean as the
+leanest tools, but a byte budget is never allowed to cost an answer. We have gone too far toward short
+answers before and cut information that was needed, so now every size limit has one of two jobs: a
+runaway guard far above typical answers (it catches an output bug, and says so when it trips), or a
+stair-step target where anything over it must be explained. A capped answer is always measured
+against the same answer uncapped, and the one that answers better wins.
 </details>
 
 ### Same answer, a fraction of the tokens — read this table first if your agent is on a budget
@@ -740,8 +844,9 @@ firing on the same function is corroboration rather than one metric counted twic
 
 That matters most for code an agent wrote. Empty-catch error masking is **+47%** more common in
 AI-authored commits, a function rewritten again inside two weeks **+15%** more likely, and reuse is
-*declining* as AI's share of commits grows (GitClear, *AI Copilot Code Quality*, 2026). Each of
-`--quality-delta`'s 10 kinds targets one measured mode like those, and it reports **only what your
+*declining* as AI's share of commits grows (GitClear, *AI Copilot Code Quality*, 2026). Ten of
+`--quality-delta`'s 11 kinds each target one measured mode like those (the eleventh, `placeholder`,
+lists the stubs and TODOs a change adds, and never gates), and it reports **only what your
 change made worse** — then `--exemplar` shows the pattern in your own repo to copy, and `--test-gate`
 names the tests that must run before "done."
 
@@ -826,7 +931,7 @@ Full retrieval tables — including the MRR figures behind the router numbers ab
 </p>
 
 <p align="center">
-  <a href="present/ripwire-showcase.pdf"><b>▶ The whole tool in 34 slides</b></a> — every figure names the instrument that pins it<br>
+  <a href="present/ripwire-showcase.pdf"><b>▶ The whole tool in 36 slides</b></a> — every figure names the instrument that pins it<br>
   <sub>renders in your browser · <a href="present/ripwire-showcase.pptx">pptx</a> beside it · <a href="docs/EVALS.md">the numbers behind it</a></sub>
 </p>
 
@@ -840,9 +945,9 @@ Full retrieval tables — including the MRR figures behind the router numbers ab
 ## What it answers
 
 <details>
-<summary><b>183 long flags</b> across seven families, plus the MCP server — and <code>--help-task</code> names the ONE command a task wants, or abstains honestly when the evidence is too thin</summary>
+<summary><b>185 long flags</b> across seven families, plus the MCP server — and <code>--help-task</code> names the ONE command a task wants, or abstains honestly when the evidence is too thin</summary>
 
-Around the core sit 183 long flags advertised in `--help`, across seven families — plus an MCP
+Around the core sit 185 long flags advertised in `--help`, across seven families — plus an MCP
 server, so a coding agent can call any of them mid-task instead of grepping and reading whole files.
 `--help` prints one line per flag (~4.5K tokens); `--help=--FLAG` prints that flag's full entry with
 every caveat, `--help=SECTION` one family, and `--help=all` the whole catalog.
@@ -1977,9 +2082,9 @@ wrong, and it has. These are the results that say so, all in-tree, all published
 ### In the tests
 
 <details>
-<summary><b>651 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary> <!-- gatecount -->
+<summary><b>665 gate scripts</b>, five contracts no unit test can hold, and the house rule: write the gate before the code it measures</summary> <!-- gatecount -->
 
-`test/regression.sh` names **651 gate scripts** and is the authoritative list; <!-- gatecount -->
+`test/regression.sh` names **665 gate scripts** and is the authoritative list; <!-- gatecount -->
 `python3 test/pargates.py . ./build/ripwire -j 6` runs the same set in parallel. On top of them sit the
 contracts that do not fit a unit test: two runs byte-identical, warm output identical to cold, output
 that pipes clean through `xmllint --noout`, a sanitizer build with `-fno-sanitize-recover=all`, and a
@@ -2329,7 +2434,7 @@ same renderer. One computation has one output shape.
 
 | Item | Requirement |
 | --- | --- |
-| Operating system | macOS (arm64 or x86-64) or Linux (arm64 or x86-64). Native Windows x64 **builds** with both clang-cl and MSVC `cl.exe` — CI builds both on `windows-latest` every full matrix and smoke-tests each binary (`--version`, `ctest`, a real crawl, the two-run byte-identical contract, well-formed XML); the 650-gate suite does not run there, and ASan is compiled but never executed, so treat it as a build, not a validated platform. From 0.6.3 a prebuilt `windows-x64` zip ships as a **preview** ([Windows](#windows)): CI unzips it and compares its output with Linux's byte for byte, but no maintainer runs Windows, so WSL2 remains the fully supported way to run it on a Windows machine. |
+| Operating system | macOS (arm64 or x86-64) or Linux (arm64 or x86-64). Native Windows x64 **builds** with both clang-cl and MSVC `cl.exe` — CI builds both on `windows-latest` every full matrix and smoke-tests each binary (`--version`, `ctest`, a real crawl, the two-run byte-identical contract, well-formed XML); the 660-gate suite does not run there, and ASan is compiled but never executed, so treat it as a build, not a validated platform. From 0.6.3 a prebuilt `windows-x64` zip ships as a **preview** ([Windows](#windows)): CI unzips it and compares its output with Linux's byte for byte, but no maintainer runs Windows, so WSL2 remains the fully supported way to run it on a Windows machine. |
 | Prebuilt Linux floor | RHEL 8 or later (glibc 2.28) |
 | Prebuilt macOS floor | macOS 14 or later, Apple silicon. 0.6.1 is the last release with an Intel macOS binary; on an Intel Mac, pin `RIPWIRE_VERSION=v0.6.1` or build from source. |
 | x86-64 floor | x86-64-v3 (Intel Haswell, 2013, or later), for a prebuilt binary and a source build alike |
@@ -2478,6 +2583,13 @@ The server is a standard input and output MCP process. The complete configuratio
 }
 ```
 
+To list fewer tools, add `--mcp-tools=` to the server's arguments: a comma list of tool names and/or the `core`
+profile (explore, batch, from_trace, impact, uses, fetch_body, edit_check, quality_delta, the loop the server's own
+instructions teach). A client that loads every tool schema at session start then pays for 8 schemas instead of 33
+(`tools/list` measured at 13,834 bytes instead of 46,368). A call to a tool that is not listed is refused with the
+flag that enables it. The list is not access control: `batch` sub-queries still reach hidden verbs. `ripwire wrap AGENT --mcp-tools=core` writes the flag
+into the recipe it prints. The default stays the full catalog.
+
 For a socket instead of standard input and output, run `ripwire --listen=HOST:PORT`. A non-loopback
 bind requires `--mcp-token`. The three edit verbs are disabled on a remote bind unless you pass
 `--allow-remote-edits`. The socket speaks plain HTTP with no TLS, so on a non-loopback bind the bearer token and
@@ -2532,7 +2644,7 @@ identity of the index, and says which one is at fault.
 
 ### 5. Command families
 
-The `--help` output groups 183 long flags advertised in `--help` into seven families. The `--help=`
+The `--help` output groups 185 long flags advertised in `--help` into seven families. The `--help=`
 column below is the argument that prints one family: `ripwire --help=navigate`. `ripwire
 --help=--FLAG` prints one flag's full text — the caveats, the units, what it refuses and why.
 `ripwire --help=all` is the whole catalog, about 46,000 tokens.
@@ -2599,10 +2711,11 @@ This is the part to wire into a script.
 | Code | Meaning |
 | --- | --- |
 | 0 | The command completed. |
-| 1 | The command refused the request. A refusal names the reason on stderr. |
+| 1 | The command refused the request. A refusal names the reason on stderr. When `--callers`, `--callees`, `--uses`, `--impact` or `--path` refuse a selector that matches no indexed definition, they also print an answer on stdout: the verb's element with `found="0"` and the name to retry with. |
 | 2 | A policy gate fired: `--arch` found a layering violation, `--scan-skill` found a CRITICAL, `--quality-delta` found new debt. |
 | 3 | The output exceeded the token budget that you set. |
 | 4 | `--test-gate` found an open obligation. |
+| 5 | The memory guard stopped the run: over `--max-memory` (default 65% of the machine's memory) with no partial answer possible, or a verb other than the default map facing a partial index. One stderr line names the limit and the override. |
 
 #### 6.3 JSON output
 
@@ -2630,9 +2743,11 @@ compiler. These limits follow:
 - A name that has several definitions at the same resolution tier produces one edge per candidate.
   Each edge carries the weight `1/k`. The symbol carries `amb="K"`. The header totals the events in
   `ambiguous=`.
-- Two further gauges sit beside `ambiguous=`. `unresolved=` counts calls whose in-repo definitions
-  were all language-filtered. `unindexed=` counts files no grammar could read, whose calls raise
-  neither of the other two.
+- Two further gauges sit beside `ambiguous=`. `unresolved=` counts calls left with no edge and no
+  proof that the target is outside the tree: every same-named in-repo definition is language-filtered
+  or out of the language's lookup (a method for a receiverless call, another Go package). `external=`
+  counts the calls the language does prove are outside (a builtin or global, an outside import).
+  `unindexed=` counts files no grammar could read, whose calls raise neither of the other two.
 
 The output uses these disclosure rules without exception:
 
@@ -2723,7 +2838,7 @@ python3 test/pargates.py . ./build/ripwire -j 6
 A new gate script must be added to `test/regression.sh` in the same change. The gate
 `test/manifestcheck.sh` enforces this rule.
 
-Another gate derives the cap inventory. The tool has 229 compile-time caps and 7 ranking parameters.
+Another gate derives the cap inventory. The tool has 236 compile-time caps and 7 ranking parameters.
 `docs/LIMITS.md` lists each cap, its value, and whether the file discloses a truncation when the cap
 fires, and `python3 docs/limits_build.py --check` proves that list against `src/`. `docs/TUNING.md`
 lists the measured cost of each cap.
@@ -3008,7 +3123,7 @@ record, and this line is only the pointer to it.
 | The compile-time cap inventory | [`docs/LIMITS.md`](docs/LIMITS.md) |
 | The measured cost of each cap | [`docs/TUNING.md`](docs/TUNING.md) |
 | Skill-file security checks | [`docs/COMMANDS.md`](docs/COMMANDS.md#--scan-skillsdir) |
-| The whole tool in 34 slides — the showcase deck | [`present/ripwire-showcase.pdf`](present/ripwire-showcase.pdf) ([pptx](present/ripwire-showcase.pptx), rebuilt by [`present/deck5_ripwire_build.js`](present/deck5_ripwire_build.js)) |
+| The whole tool in 36 slides — the showcase deck | [`present/ripwire-showcase.pdf`](present/ripwire-showcase.pdf) ([pptx](present/ripwire-showcase.pptx), rebuilt by [`present/deck5_ripwire_build.js`](present/deck5_ripwire_build.js)) |
 
 If a document disagrees with `--help`, the document is the bug.
 

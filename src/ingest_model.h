@@ -450,6 +450,11 @@ inline void assignSymbols( IngestResult& result, std::vector<RawDef>& rawDefs, b
             s.sigEndByte   = 0;
             s.endByte      = 0;
         }
+        if( d.fnScopeEnd != 0 )   // a function-local def: its binding function's span, ascending id by construction
+        {
+            s.fnLocal = 1;
+            result.fnLocalScopes.push_back( FnLocalScope{ s.id, d.fnScopeStart, d.fnScopeEnd } );
+        }
         result.symbols.push_back( std::move( s ) );
     }
 
@@ -911,6 +916,8 @@ inline void emitReferences( IngestResult& result, std::vector<RawRef>& rawRefs, 
         ref.argCountKnown = r.argCountKnown; // B2.2: whether argCount is reliable (no spread/splat)
         ref.viaArrow    = r.viaArrow;    // a call written `->`; a compose ref's smart-pointer pointee (arm p)
         ref.qualifierRootsStd = r.qualifierRootsStd;   // #150: the FULL written qualifier chain is rooted at std
+        ref.memberCall  = r.memberCall;                 // FE-A: a Go/JS/TS/Rust member call (recv stays None)
+        ref.memberRoot  = std::move( r.memberRoot );    // FE-A: its receiver chain's root identifier
         ref.fieldName   = std::move( r.fieldName );   // S5-E: the member variable name (e.g. "m_pool")
         ref.composeRel  = std::move( r.composeRel );  // S5-E: "creates" or "uses"
         ref.startByte   = r.startByte;                // shadow fix round: for the block-span containment test

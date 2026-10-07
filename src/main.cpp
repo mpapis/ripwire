@@ -541,6 +541,7 @@ struct MainDispatch
 #include "verbs_change.h"
 #include "verbs_report.h"
 #include "verbs_grep.h"
+#include "memguard.h"            // #350 layer 3: the memory guard's limit (installed in main) and its verdicts after ingest
 #include "lsp.h"                 // the --lsp navigation-server section (Phase 1 PoC — docs/LSP.md); after the verb families so it can reuse the shared use-site scan
 
 // ── LANGUAGE-REGISTRATION COMPLETENESS, at compile time ──────────────────────────────────────────────────────────
@@ -1395,8 +1396,12 @@ inline ChurnRanking churnDecayRanking( const MainDispatch& d, const rw::SinceSco
     {
         ranked.rank.assign( d.ing.symbols.size(), 0.0f );
     }
-    std::string window = churnWindowStamp( churnDecayWindowLabel( isScoped ? std::string_view( d.cfg.since ) : std::string_view( "all-history" ) ),
-                                           mined.anyHistory );
+    // 0.6.6 command sweep: "all-history" over a depth-1 clone's single commit was false — the decay mined only what
+    // was fetched. A shallow clone's unscoped span is named for what it is, and the stamp says why.
+    const bool  shallow = gitstamp::isShallow( d.root );
+    std::string window  = churnWindowStamp( churnDecayWindowLabel( isScoped ? std::string_view( d.cfg.since )
+                                                                            : std::string_view( shallow ? "fetched-history" : "all-history" ) ),
+                                            mined.anyHistory, shallow );
     discloseUniformChurnFallback( mined.anyHistory, stubbed, verbLabel, window );
     ChurnRanking cr{ std::move( ranked.rank ), std::move( window ), { ranked.iterationCount, ranked.hasConverged, !stubbed } };
     // ONE build + ONE sort of the decayed rows, shared by both blocks (gitmine.h decayedRecentRowsSorted).
@@ -1444,7 +1449,8 @@ inline ChurnRanking churnRankedGraph( const MainDispatch& d )
     // F1: the DEFAULT window's stamp names the anchor that produced it ("18mo@HEAD"); an ACTIVE --since is
     // the user's own value and is stamped verbatim, exactly as before.
     const std::string  defaultWindow = rw::defaultWindowLabel( d.root, "18mo" );
-    std::string        window = churnWindowStamp( isScoped ? std::string_view( d.cfg.since ) : std::string_view( defaultWindow ), hasChurnEvidence );
+    std::string        window = churnWindowStamp( isScoped ? std::string_view( d.cfg.since ) : std::string_view( defaultWindow ), hasChurnEvidence,
+                                                  gitstamp::isShallow( d.root ) );   // 0.6.6: the window mined only the fetched commits
     // stubbed=false: this is the undecayed --rank-by=churn arm, which --in=DIR does not ride (it is refused
     // outside churn-decay), so a ranking really did run and the uniform sentence is the true one.
     discloseUniformChurnFallback( hasChurnEvidence, false, verbLabel, window );
@@ -1652,6 +1658,13 @@ int runDefaultMap( const MainDispatch& d )
     }
 
     std::vector<float> rank;
+    // The map scope (docs/EVALS.md "Map data Sections never crowd code out of the default map"): the plain map — XML,
+    // --json, --html, --max-tokens — at the default --rank-by with no payload verb picks its rows code-first
+    // (serialize.h codeFirstKeep) and discloses the Sections that pick swapped out. The rank vector is untouched.
+    // --query, --map-diff, churn, authority/hub/rrf and a payload verb's ride-along map (--expand, --outline,
+    // --pack-signatures, --pack-top-n) keep the plain rank-order cut.
+    const bool isDefaultMapScope = cfg.query.empty() && !cfg.mapDiff && cfg.rankBy == RankBy::PageRank && cfg.expand.empty()
+                                && cfg.outline.empty() && !cfg.packSignatures && cfg.packTopN <= 0;
     // W2-F: the map header's pr_iters= / pr_converged= (src/prconverge.h). Default-constructed is
     // isPageRank=false — CORRECT for the arms below that run no power iteration (a lexical query score, the
     // HITS vectors that overwrite `rank`); the PageRank arms fill it via rw::takeRank (graph.h), never apart.
@@ -1854,6 +1867,7 @@ int runDefaultMap( const MainDispatch& d )
     mapAnn.recentMinedHistory = recentAnyHistory;   // the block rides on the FACT (serialize.h writeRecentRows)
     mapAnn.recentMergeBombsSkipped = recentMergeBombsSkipped;   // rides <recent> (the rows' own window), filled by assignment like seed
     mapAnn.notesDegraded = d.notesDegraded;   // L3 follow-up (CodeRabbit 4053600616): onto every <r> this run emits
+    mapAnn.codeFirstRows = isDefaultMapScope;   // the code-first row pick + its data_sections_cut= / next= (serialize.h)
     // C1-b (2026-09-12): --in=DIR — the scoped block and the map stub, filled by assignment like seed. The two next= strings
     // outlive every serialize() call below (mapAnn holds views into them). The scoped next= is the SAME run at the next
     // offset, page size carried when the caller set one; the stub's next= is the same run without in= (the map it stubbed).
@@ -2116,7 +2130,7 @@ int runDefaultMap( const MainDispatch& d )
         htmlColor.atStamp  = htmlProv.atStamp;
         htmlColor.rootName = htmlProv.rootName;
         htmlColor.version  = kRipwireVersion;
-        writeHtml( htmlOut, ing, rank, g, mapTopK, htmlColor, mapRootArg );   // R-R
+        writeHtml( htmlOut, ing, rank, g, mapTopK, htmlColor, mapRootArg, /*codeFirstRows=*/isDefaultMapScope );   // R-R
         if( htmlOut != stdout )
         {
             std::fclose( htmlOut );
@@ -3416,6 +3430,18 @@ int runHelpTask( const rw::Config& cfg, const rw::IngestResult& ing, const std::
     return 0;
 }
 
+// #350: an edit over an index the memory guard cut refuses first (runEditVerb / editplan::run), and that refusal line
+// already names the guard — so it answers for the stop and exits 5, rather than 1 plus the backstop's second line
+int editRefusalExit() noexcept
+{
+    if( !rw::memguard::hasUnansweredStop() )
+    {
+        return 1;
+    }
+    rw::memguard::answerStops();
+    return 5;
+}
+
 std::optional<int> runCliEditPlan( const rw::Config& cfg )
 {
     const bool hasMode = cfg.editPlanDryRun || cfg.editPlanApply;
@@ -3444,7 +3470,7 @@ std::optional<int> runCliEditPlan( const rw::Config& cfg )
     if( !outcome.ok )
     {
         rw::emitTo( stderr, "ripwire edit-plan: {}\n", outcome.message.c_str() );
-        return 1;
+        return editRefusalExit();
     }
     std::puts( outcome.receipt.c_str() );
     return 0;
@@ -3525,7 +3551,7 @@ std::optional<int> runCliEdit( const rw::Config& cfg )
         const char* const editFlag = !cfg.replaceSymbolBody.empty() ? "--replace-symbol-body"
                                        : !cfg.insertBeforeSymbol.empty() ? "--insert-before-symbol" : "--insert-after-symbol";
         rw::emitTo( stderr, "ripwire: {}: {}\n", editFlag, outcome.message.c_str() );
-        return 1;
+        return editRefusalExit();
     }
 
     std::fputs( outcome.resultJson.c_str(), stdout );
@@ -3922,6 +3948,28 @@ static int runWithCompactLegend( const rw::Config& cfg, char** argv )
     return finishCompactCapture( cfg, doc, rc );
 }
 
+// #350 layer 3: the memory guard's limit, resolved ONCE, before any thread exists — the flag, else RIPWIRE_MAX_MEMORY,
+// else the machine's default (memguard.h). An environment value is external input: VALIDATEd, and refused like the flag.
+static bool installMemoryGuard( const rw::Config& cfg )
+{
+    std::size_t          bytes  = cfg.maxMemoryBytes;
+    rw::memguard::Source source = rw::memguard::Source::Flag;
+    const char* const    env    = std::getenv( "RIPWIRE_MAX_MEMORY" );
+    if( bytes == 0 && env != nullptr && *env != '\0' )
+    {
+        const bool envParsed = rw::parseMemoryLimit( env, bytes );
+        if( !VALIDATE( envParsed, "RIPWIRE_MAX_MEMORY is a byte size of at least 64M" ) )
+        {
+            DISCLOSE( Diagnostics::answerRefused, "main: an unparseable RIPWIRE_MAX_MEMORY refuses the run (exit 1, stderr names it)" );
+            rw::emitTo( stderr, "ripwire: RIPWIRE_MAX_MEMORY needs a byte size of at least 64M, plain or with a K/M/G suffix — got '{}', e.g. RIPWIRE_MAX_MEMORY=8G\n", env );
+            return false;
+        }
+        source = rw::memguard::Source::Env;
+    }
+    rw::memguard::install( bytes, source );
+    return true;
+}
+
 int main( int argc, char** argv )
 {
     using namespace rw;
@@ -3973,15 +4021,90 @@ int main( int argc, char** argv )
     {
         return 1;
     }
+    if( !installMemoryGuard( cfg ) )
+    {
+        return 1;   // the refusal is on stderr
+    }
     // harvest 2026-09-09: a hook-form core.fsmonitor in a crawl root's own .git/config is a command git would run on
     // every read-only call this process makes; neutralise it HERE — one site, before any thread or git child — and
     // disclose it (stderr + --doctor). githarden.h holds the measurement and the reasoning.
     githarden::hardenForRoots( cfg.roots );
-    return runWithCompactLegend( cfg, argv );
+    const int rc = runWithCompactLegend( cfg, argv );
+    // #350: the backstop — an ingest the memory guard stopped inside a verb that does not read the stop (memguard.h).
+    // The servers answer for their own stops per request (the MCP envelope's _memory_stop), so they are exempt.
+    // Whatever exit code the verb chose becomes 5: a verdict (0, a gate's 2, a budget's 3, an obligation's 4) computed
+    // from a partial ingest is not a verdict, and a refusal (1) printed after one may name a false cause (a HEAD tree
+    // the guard only partly read reads as "no git HEAD").
+    if( !cfg.mcp && !cfg.lsp && rw::memguard::hasUnansweredStop() )
+    {
+        rw::emitTo( stderr, "ripwire: the memory guard stopped an ingest this answer depends on, so the answer (or refusal) above may be incomplete or wrong — {}\n", rw::memguard::kOverride );
+        return 5;
+    }
+    return rc;
+}
+
+// #350: the flags on the map's own path (no report verb won) that cannot answer from a memory-guard partial index, in
+// the order they are named: the renderings with no header to carry memory_stop= (--html, --mermaid); the modifiers that
+// resolve a SELECTOR against the index — --expand/--outline a symbol name (one in a file the guard never parsed would
+// read as "matched no symbol", a false none-found), --in=DIR a directory against the crawl's files (only a crawl stop
+// cuts those: a directory it never reached would read as "no indexed file"); and --pin-census, which writes the
+// resolver's census to a file with no header to carry the cut. nullptr: the map answers, disclosed in its header.
+static const char* mapFlagRefusingPartial( const rw::Config& cfg, const rw::MemoryStop& stop )
+{
+    const struct
+    {
+        bool        active;
+        const char* flag;
+    } rows[] = {
+        { cfg.html, "--html" },
+        { cfg.mermaid, "--mermaid" },
+        { !cfg.expand.empty(), "--expand" },
+        { !cfg.outline.empty(), "--outline" },
+        { !cfg.inDir.empty() && stop.phase == rw::MemoryStop::Phase::Crawl, "--in" },
+        { !cfg.pinCensus.empty(), "--pin-census" },
+    };
+    for( const auto& row : rows )
+    {
+        if( row.active )
+        {
+            return row.flag;
+        }
+    }
+    return nullptr;
 }
 
 // Everything main() did after parseArgs — the verb dispatch — behind one seam so --legend=compact can wrap the
 // run's stdout once (runWithCompactLegend above) instead of teaching ~60 emitters a second dialect.
+// #350 layer 3: a memory-guard stop leaves a PARTIAL ingest. Only the default map carries the disclosure in its own
+// header (memory_stop= …), so only a run whose verb table names no winner — the map — answers from it, with one stderr
+// line beside it; every other verb refuses rather than answer from a partial index as if it were the tree. An ingest
+// that stopped before anything was built (no files, or no file parsed) cannot answer at all. Exit 5 for both refusals.
+// Returns 0 when the run may continue (no stop, or a map run with its disclosure).
+static int memoryStopExit( const rw::IngestResult& ing, const rw::Config& cfg, const char* winnerVerb )
+{
+    const rw::MemoryStop& stop = ing.memoryStop;
+    if( !stop.isSet() )
+    {
+        return 0;
+    }
+    rw::memguard::answerStops();   // every branch below answers for the stop: a refusal, or the disclosed map
+    if( ing.files.empty() || ( stop.parseCut && stop.parsedFiles == 0 ) )
+    {
+        DISCLOSE( Diagnostics::answerRefused, "main: the memory guard stopped the ingest before anything was built — exit 5, one stderr line" );
+        rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::nothingBuiltLine( stop ) );
+        return 5;
+    }
+    const char* const refusingVerb = winnerVerb != nullptr ? winnerVerb : mapFlagRefusingPartial( cfg, stop );
+    if( refusingVerb != nullptr )
+    {
+        DISCLOSE( Diagnostics::answerRefused, "main: a verb other than the map refuses a memory-guard partial ingest — exit 5, one stderr line" );
+        rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::verbRefusalLine( stop, refusingVerb ) );
+        return 5;
+    }
+    rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::softStopLine( ing ) );
+    return 0;
+}
+
 static int dispatchMain( const rw::Config& cfg, char** argv )
 {
     using namespace rw;
@@ -4157,6 +4280,19 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
 
     if( cfg.mcp )
     {
+        // --mcp-tools: validated here, against mcp.h's tool table (cli.h does not include it) — before either
+        // transport starts, so a bad name is an exit 1 with the valid names, never a server with a surprise catalog.
+        McpToolSpec tools{ .mask = kMcpAllToolsMask };
+        if( !cfg.mcpTools.empty() )
+        {
+            tools = mcpParseToolSpec( cfg.mcpTools );
+        }
+        if( !tools.refusal.empty() )
+        {
+            DISCLOSE( Diagnostics::answerRefused, "a bad --mcp-tools list exits 1 with the reason and the valid names on stderr; no server starts" );
+            rw::emitTo( stderr, "ripwire: {}\n", tools.refusal );
+            return 1;
+        }
         // --listen picks the remote Streamable-HTTP transport; otherwise stdio. Both
         // route every request through the SAME shared handler (mcp.h dispatchMcpLine) — byte-identical payloads.
         if( !cfg.listen.empty() )
@@ -4180,6 +4316,8 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
             hc.stable           = cfg.stable;
             hc.noRedact         = cfg.noRedact;
             hc.allowRemoteEdits = cfg.allowRemoteEdits;
+            hc.toolMask         = tools.mask;
+            hc.toolSpec         = std::string( cfg.mcpTools );
             return runMcpHttp( hc );
         }
         // X7 (D3/D4): thread the SAME positional-root plumbing the HTTP branch above uses into the stdio
@@ -4190,7 +4328,8 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         {
             mcpRoots.emplace_back( r );
         }
-        return runMcp( cfg.topK, cfg.stable, cfg.noRedact, std::string( cfg.rootPath ), mcpRoots );   // P2-C: --mcp turns --stable on by default (set in parseArgs); A3-F3: the server redacts by default like the CLI
+        return runMcp( { .topK = cfg.topK, .stable = cfg.stable, .noRedact = cfg.noRedact, .root = std::string( cfg.rootPath ),
+                         .roots = mcpRoots, .toolMask = tools.mask, .toolSpec = std::string( cfg.mcpTools ) } );   // P2-C: --mcp turns --stable on by default (set in parseArgs); A3-F3: the server redacts by default like the CLI
     }
 
     // ── multi-root workspace refusals: each cut verb refuses with ONE clear stderr
@@ -4320,8 +4459,10 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         {
             rows.push_back( { path, f } );
         }
-        printSkillScanArtifact( stdout, rows, /*filesScanned=*/1, /*filesSkipped=*/0, cfg.legend == "full" );
-        rw::emitTo( stderr, "ripwire scan: {} finding(s) in {}\n", int( result.findings.size() ), path.c_str() );
+        const bool notFlowScanned = result.kind == SkillFileKind::OtherCode;
+        printSkillScanArtifact( stdout, rows, SkillScanTally{ 1, 0, notFlowScanned ? 1 : 0, {} }, cfg.legend == "full" );
+        rw::emitTo( stderr, "ripwire scan: {} finding(s) in {}{}\n", int( result.findings.size() ), path.c_str(),
+                    notFlowScanned ? " (a code file this scanner has no network-flow model for: not flow-scanned)" : "" );
         return skillScanExitCode( result.findings );
     }
 
@@ -4347,6 +4488,29 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
 
         // Determine directories to scan: explicit dir, or defaults. De-duplicate because CODEX_HOME may
         // intentionally name one of the other roots in an isolated/managed environment.
+        // Review M5: the bare form walks fixed skill homes and never the positional root, so `ripwire <dir> --scan-skills` used
+        // to answer files="0" verdict="clean" for a <dir> holding a CRITICAL script. A root other than the current directory is
+        // refused by name (exit 3, this verb's "never scanned it" code — 0/1/2 are verdicts) instead of answering for it.
+        if( cfg.scanSkillsDir.empty() )
+        {
+            namespace fs = std::filesystem;
+            std::error_code cwdEc;
+            const fs::path  cwd = fs::weakly_canonical( fs::current_path( cwdEc ), cwdEc );
+            for( const std::string_view root : cfg.roots )
+            {
+                std::error_code rootEc;
+                const fs::path  canon = fs::weakly_canonical( fs::path( std::string( root ) ), rootEc );
+                if( !VALIDATE( !cwdEc && !rootEc && canon == cwd, "a bare --scan-skills root must be the current directory" ) )
+                {
+                    DISCLOSE( Diagnostics::answerRefused, "main: bare --scan-skills with a positional root other than the cwd — exit 3 and one ripwire: refusal line on stderr (a dev build also prints its diagnostic trace)" );
+                    rw::emitTo( stderr, "ripwire: --scan-skills: the bare form scans ./.agents/skills and the Claude and Codex skill homes, "
+                                        "never the root '{}' — pass --scan-skills={} (or cd there) to scan that directory; no scan performed\n",
+                                root, root );
+                    return 3;
+                }
+            }
+        }
+
         std::vector<std::string> dirs;
         const auto addDir = [&]( std::string dir )
         {
@@ -4412,6 +4576,7 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         int      filesScanned  = 0;
         int      filesSkipped  = 0;          // seen but not scannable: binary, or unreadable
         int      prunedDirs    = 0;          // denylisted subtrees not descended
+        int      codeNotFlowScanned = 0;     // readable SkillFileKind::OtherCode files (a language with no network-flow model)
         int      maxSev        = 0;          // 0=clean, 1=warn, 2=critical
 
         for( const std::string& dir : dirs )
@@ -4504,6 +4669,10 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
                 }
 
                 ++filesScanned;
+                if( res.kind == SkillFileKind::OtherCode )
+                {
+                    ++codeNotFlowScanned;
+                }
                 for( const SkillFinding& f : res.findings )
                 {
                     allRows.push_back( { p, f } );
@@ -4517,15 +4686,24 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
             }
         }
 
-        printSkillScanArtifact( stdout, allRows, filesScanned, filesSkipped, cfg.legend == "full" );
+        std::string dirsWalked;   // bare form only: the answer names what it walked (review M5); a DIR form names its DIR itself
+        if( cfg.scanSkillsDir.empty() )
+        {
+            for( const std::string& d : dirs )
+            {
+                dirsWalked += ( dirsWalked.empty() ? "" : ";" ) + d;
+            }
+        }
+        printSkillScanArtifact( stdout, allRows, SkillScanTally{ filesScanned, filesSkipped, codeNotFlowScanned, dirsWalked }, cfg.legend == "full" );
 
         // Honest zero: "0 finding(s)" alone doesn't say whether that's because nothing was WARN/CRITICAL
         // or because there was nothing readable to scan. Naming the file count keeps a genuine "scanned
         // 0 skill files" (an empty/unpopulated dir — a real measurement) legible on its own, distinct from
         // this same verb's exit-3 refusal above (which never gets here). §B13.3 adds the other half of the
         // population to the same line: what the walk saw and could not scan, and what it did not descend.
-        rw::emitTo( stderr, "ripwire scan: {} finding(s) total ({} skill file(s) scanned, {} unscannable file(s) skipped, {} denylisted subtree(s) not descended)\n",
-                      totalFindings, filesScanned, filesSkipped, prunedDirs );
+        rw::emitTo( stderr, "ripwire scan: {} finding(s) total ({} skill file(s) scanned, {} unscannable file(s) skipped, {} denylisted subtree(s) not descended{})\n",
+                      totalFindings, filesScanned, filesSkipped, prunedDirs,
+                      codeNotFlowScanned > 0 ? ", " + std::to_string( codeNotFlowScanned ) + " code file(s) not flow-scanned" : std::string() );
         return maxSev;
     }
 
@@ -4605,6 +4783,16 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         // (measured on the fixture, uses+slice: 8,840 B full, 8,645 B outer-only, 4,478 B with the subs). The
         // whole-stdout layer cannot do it — it must not rewrite inside CDATA — so the batch assembler does,
         // through the SAME helper the MCP twin calls. Gate: batchcheck (a)/(h) and compactlegendcheck.
+        // #350: the sub-answers carry no memory disclosure of their own, so a batch whose index the guard cut
+        // refuses whole (a sub-answer's "not found" could be a file the guard never parsed) — nothing on stdout
+        if( rw::memguard::hasUnansweredStop() )
+        {
+            rw::memguard::answerStops();
+            DISCLOSE( Diagnostics::answerRefused, "main: --batch over a memory-guard partial ingest refuses — exit 5, one stderr line" );
+            rw::emitTo( stderr, "ripwire: the memory guard stopped the ingest --batch reads; --batch cannot answer from a partial index — {}\n",
+                        rw::memguard::kOverride );
+            return 5;
+        }
         if( cfg.legend == "compact" )
         {
             rw::applyCompactToBatchSubs( subs );
@@ -4734,9 +4922,28 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
             sinceHasBaseline       = !scope.baselineSha.empty();
             sinceBaselineRefused   = scope.baselineRefused;
         }
+        // 0.6.7 shallow-history tail: a rev that no root resolves may simply lie past a depth-limited clone's fetched history.
+        // The probe reads EVERY root (a full primary beside a shallow secondary is the multi-root shape the 0.6.6 review
+        // caught on the mining verbs); the first shallow root's hint rides the refusal, "" on full clones (byte-identical).
+        std::string sinceShallowHint;
+        if( multiRoot )
+        {
+            for( const WorkspaceRoot& r : ws )
+            {
+                sinceShallowHint = rw::gitstamp::shallowRefHint( r.arg );
+                if( !sinceShallowHint.empty() )
+                {
+                    break;
+                }
+            }
+        }
+        else
+        {
+            sinceShallowHint = rw::gitstamp::shallowRefHint( root );
+        }
         if( !sinceResolvesSomewhere )
         {
-            rw::emitTo( stderr, "{}\n", sinceUnresolvedRefusal( cfg.since ).c_str() );
+            rw::emitTo( stderr, "{}\n", sinceUnresolvedRefusal( cfg.since, sinceShallowHint ).c_str() );
             return 1;
         }
         // N4 (capture-audit verify-wave1 2026-09-04): the SECOND half of the one policy. A value that resolves as a
@@ -4751,7 +4958,7 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         const bool sinceHostNeedsBaseline = activeSinceHostNeedsBaseline( cfg );
         if( sinceHostNeedsBaseline && !sinceHasBaseline && gitRepoHasHistory( multiRoot ? ws[0].arg : root ) )
         {
-            rw::emitTo( stderr, "{}\n", sinceNoBaselineRefusal( cfg.since, multiRoot ? ws[0].arg : root, sinceBaselineRefused ).c_str() );
+            rw::emitTo( stderr, "{}\n", sinceNoBaselineRefusal( cfg.since, multiRoot ? ws[0].arg : root, sinceBaselineRefused, sinceShallowHint ).c_str() );
             return 1;
         }
     }
@@ -4845,6 +5052,16 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
             }
             parts.push_back( ingest( r.arg.c_str(), cfg.excludes, cachePath, cfg.maxFileBytes, needsValueUses,
                                      /*excludeLabel=*/r.label, /*respectGitignore=*/!cfg.noIgnore ) );
+            // #350: the hard line after EACH root, so an over-limit workspace stops before ingesting the next one
+            // (the post-merge check below still runs for the last root and the merge itself)
+            if( parts.size() < ws.size() && rw::memguard::overHardLimit() )
+            {
+                rw::memguard::answerStops();   // this refusal answers for any stop the roots so far recorded
+                DISCLOSE( Diagnostics::answerRefused, "main: over the memory guard's hard limit between workspace roots — exit 5, one stderr line" );
+                rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::hardStopLine( "ingest of workspace root " + std::to_string( parts.size() ) + " of "
+                                                                                   + std::to_string( ws.size() ) + " (" + r.label + ")" ) );
+                return 5;
+            }
         }
         ing = mergeWorkspaceIngests( ws, parts );
     }
@@ -4859,6 +5076,19 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         }
         ing = ingest( root.c_str(), cfg.excludes, cacheArg, cfg.maxFileBytes, needsValueUses,
                       /*excludeLabel=*/{}, /*respectGitignore=*/!cfg.noIgnore );
+    }
+    // #350 layer 3: the hard line first (over it nothing answers, and only its one line is printed), then what a
+    // memory-guard stop allows this run to answer (memoryStopExit).
+    if( rw::memguard::overHardLimit() )
+    {
+        rw::memguard::answerStops();   // the refusal answers for any stop the ingest recorded
+        DISCLOSE( Diagnostics::answerRefused, "main: over the memory guard's hard limit after the ingest — exit 5, one stderr line" );
+        rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::hardStopLine( "ingest" ) );
+        return 5;
+    }
+    if( const int rc = memoryStopExit( ing, cfg, verbPrec.winner ); rc != 0 )
+    {
+        return rc;
     }
     if( cfg.ignoreTests )
     {
@@ -4922,6 +5152,12 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
     std::thread       grepPhaseWorker = startGrepScanPrefetch( cfg, ing, verbPrec.winner, grepPhases );
     const Graph       g               = buildGraph( ing, scipPtr, !cfg.pinCensus.empty() );
     joinGrepScanPrefetch( grepPhaseWorker );
+    if( rw::memguard::overHardLimit() )   // #350: the hard line between the graph build and the verbs
+    {
+        DISCLOSE( Diagnostics::answerRefused, "main: over the memory guard's hard limit after the graph build — exit 5, one stderr line" );
+        rw::emitTo( stderr, "ripwire: {}\n", rw::memguard::hardStopLine( "graph build" ) );
+        return 5;
+    }
 
     // --pin-census (src/pincensus.h): written straight after the graph build, BEFORE verb dispatch, so it
     // reflects the resolver and is produced whichever verb the run serves. The root condition is the map's

@@ -101,10 +101,12 @@ std::optional<int> loadRefPairDelta( const std::string& root, std::string_view s
             // The did-you-mean here cannot be a spelling neighbourhood — git already owns the ref namespace and
             // has no cheap enumeration of it — so the adjacent help names the PROBE and the three causes that
             // actually produce this on an agent's machine, which is more use than a guessed nearest ref.
-            rw::emitTo( stderr, "ripwire: --quality-delta: '{}' does not resolve to a commit in {}\n"
+            // 0.6.7: the cause list below GUESSES; on a depth-limited clone the probe KNOWS, so the first line names it
+            // (gitstamp::shallowRefHint — the same sentence pr-context and merge-scout print; "" on a full clone).
+            rw::emitTo( stderr, "ripwire: --quality-delta: '{}' does not resolve to a commit in {}{}\n"
                                   "  check it with `git -C {} rev-parse --verify {}^{{commit}}`; the usual causes are a typo, a ref that\n"
                                   "  lives only on a remote you have not fetched, or a shallow clone whose history stops before it\n",
-                          ref.badToken.c_str(), root.c_str(), root.c_str(), ref.badToken.c_str() );
+                          ref.badToken.c_str(), root.c_str(), rw::gitstamp::shallowRefHint( root ), root.c_str(), ref.badToken.c_str() );
             return 1;
         case quality::RefSpecStatus::BadRange:
             rw::emitTo( stderr, "ripwire: --quality-delta: '{}' uses the three-dot form; this compares two TREES, so spell it A..B "
@@ -180,6 +182,7 @@ struct DeltaBasis
     rw::quality::IdentityHealing                        healing;
     std::size_t                                         registerMacroExcluded = 0;   // P2.2: disclosed dead-code exemption count
     std::size_t                                         declinedCallExcluded  = 0;   // dead-code exemption by a declined call (quality.h isDeadCandidate)
+    std::size_t                                         valueRefExcluded      = 0;   // dead-code exemption: held as a VALUE (valuerefindex.h)
     std::size_t                                         apiNewSurface         = 0;   // Q-DIAL-4: new PUBLIC symbols this change added — the count that replaced one never-gating row each
     std::size_t acksBadLines = 0;   // 2026-09-06: .ripwire_quality_acks lines skipped as unparseable (disclosed on the root)
     // #228: WHICH basis produced baseSel.snapshot when the marker is one of the git-HEAD family, and WHY when
@@ -227,7 +230,7 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
                                              out.deltaRoot, root, cfg.qualityAck, refs.rangeSpan );
         out.regs    = quality::computeDelta( refs.target().ing, refs.target().g, out.baseSel.snapshot,
                                              out.deltaRoot, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded, &out.apiNewSurface,
-                                             &out.cloneIdioms, &out.declinedCallExcluded );
+                                             &out.cloneIdioms, &out.declinedCallExcluded, &out.valueRefExcluded );
         return std::nullopt;
     }
 
@@ -308,7 +311,7 @@ std::optional<int> resolveDeltaBasis( const MainDispatch& d, const std::string& 
     out.healing = quality::healIdentity( out.baseSel.snapshot, out.acks, d.ing, d.g,
                                          std::string( cfg.rootPath ), root, cfg.qualityAck );
     out.regs = quality::computeDelta( d.ing, d.g, out.baseSel.snapshot, cfg.rootPath, cfg.excludes, cfg.maxFileBytes, &out.registerMacroExcluded, &out.apiNewSurface,
-                                      &out.cloneIdioms, &out.declinedCallExcluded );
+                                      &out.cloneIdioms, &out.declinedCallExcluded, &out.valueRefExcluded );
     return std::nullopt;
 }
 
@@ -517,7 +520,7 @@ std::optional<int> refuseForeignAckSelection( const rw::Config& cfg, const rw::q
 // this prose either: several gates grep the header counters (regressions=, gating=, stale=) and a
 // quoted example here would be matched ahead of the real one.
 
-// Always. The verb, the ten kinds, the three axes, the exit predicate, and the two counters that are
+// Always. The verb, the eleven kinds, the three axes, the exit predicate, and the two counters that are
 // printed even at zero. Every row in the document — finding rows and stale-ack rows alike — carries
 // kind=, so it is defined here rather than in either conditional row dictionary.
 // P8 (L7): the bar= literals in emitRow mirror quality.h's constants — pinned here so a moved bar cannot drift the row
@@ -527,9 +530,10 @@ static_assert( rw::quality::kCcxBar == 15 && rw::quality::kLocBar == 60 && rw::q
 inline constexpr const char* kQdLegendCore =
     "<!-- ripwire quality-delta: only what a change made WORSE against the floor baseline= names below. "
     "Descriptive: weigh and fix the real ones, do not game the number (a wrong abstraction beats a low "
-    "score). TEN KINDS, and kind= on every row names which one: complexity over the ccx bar, verbosity "
+    "score). ELEVEN KINDS, and kind= on every row names which one: complexity over the ccx bar, verbosity "
     "(LOC), nesting, params, duplication, dead-code, api-surface (new public contract drift), "
-    "error-masking, short-horizon-churn, new-clone-of-reused-helper. THREE independent axes, in this "
+    "error-masking, short-horizon-churn, new-clone-of-reused-helper, placeholder (added stub/TODO). "
+    "THREE independent axes, in this "
     "order: (1) acked findings are suppressed entirely (acked= counts them); (2) ORIGIN — a finding on a "
     "symbol that EXISTED at the baseline is preexisting-worse (no origin attribute), one that exists only "
     "because the code is NEW carries origin=\"new-symbol\"; (3) MATERIALITY — a small numeric delta is "
@@ -621,7 +625,7 @@ inline constexpr const char* kQdBaseRefPair =
     "compared two COMMITTED trees and no sidecar was read, written or deleted. base_ref= and target_ref= "
     "are the two RESOLVED shas, at full length because a wave number gets quoted into handoffs, and they "
     "are the anchor, so at= is omitted. churn= is reported unavailable there, which is the honest statement "
-    "that one of the ten kinds, short-horizon-churn, cannot be measured at all in that form: it needs git "
+    "that one kind, short-horizon-churn, cannot be measured at all in that form: it needs git "
     "history at the tree being judged, and both trees are materialized OUT of the repo into temp dirs. Its "
     "silence in such a report is not evidence that nothing churned. ";
 // #228 — emitted only when head_basis= is on the root, i.e. only when the identity basis produced the floor.
@@ -711,6 +715,19 @@ inline constexpr const char* kQdRowLegend =
     "Every row the header's gating= counter counts also carries a gating attribute "
     "set to 1 — marked positively, never by the ABSENCE of sev or origin. ";
 
+// Emitted only when a placeholder row is in the document: why every one of them carries origin="new-symbol",
+// including one that landed in a symbol that existed at the baseline.
+inline constexpr const char* kQdPlaceholderLegend =
+    "placeholder is new-symbol by construction: the finding is the stub or TODO the change added, never "
+    "something that existed getting worse, so it never gates. ";
+
+// Emitted only when an error-masking row is sev="minor" — the one way that kind is ever minor, so the
+// sentence explains a state the reader is looking at and costs nothing on any other report.
+inline constexpr const char* kQdMaskReportOnlyLegend =
+    "An error-masking row is sev=\"minor\" when every construct it added is a widened shape that does not "
+    "gate in that language yet: log-only (a broad handler whose body only logs and never names the error) "
+    "or rethrow-only (the sole handler re-throws the error unchanged). ";
+
 // Emitted only when a clone-family row (duplication / new-clone-of-reused-helper) is in the document,
 // which is what puts members=, tokens= and idiom= on a first screen. A clean tree has none.
 inline constexpr const char* kQdCloneLegend =
@@ -783,6 +800,7 @@ struct QualityDeltaLegendParts
     std::size_t                                   baselineAbsorbed; // H11: baseline_absorbed= on the root (0 = attribute absent)
     const char*                                   headBasis;     // #228: head_basis= value on the root (nullptr = attribute absent)
     bool                                          anyDeclinedCallExcluded = false;   // declined-call-excluded= is on the root
+    bool                                          anyValueRefExcluded     = false;   // value-ref-excluded= is on the root
 };
 
 // A DEFINITION IS EMITTED WHEN THE THING IT DEFINES IS IN THE DOCUMENT. Nothing is dropped and no limit is
@@ -797,6 +815,14 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
             if( r.kind == "duplication" || r.kind == "new-clone-of-reused-helper" ) { return true; }
         }
         return false;
+    };
+    const auto anyMinorMaskRow = [] ( const std::vector<rw::quality::Regression>& v )
+    {
+        return std::any_of( v.begin(), v.end(), []( const rw::quality::Regression& r ) { return r.kind == "error-masking" && r.isMinor; } );
+    };
+    const auto anyPlaceholderRow = [] ( const std::vector<rw::quality::Regression>& v )
+    {
+        return std::any_of( v.begin(), v.end(), []( const rw::quality::Regression& r ) { return r.kind == "placeholder"; } );
     };
 
     std::fputs( kQdLegendCore, stdout );
@@ -840,6 +866,13 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
         std::fputs( "declined-call-excluded= is a FLOOR, not a finding: symbols this run kept out of the dead-code kind only because a call "
                     "the resolver declined to bind (the map's declined=) could have meant them. Never gates; absent at zero. ", stdout );
     }
+    if( p.anyValueRefExcluded )
+    {
+        rw::emitRaw( stdout, "value-ref-excluded= is a FLOOR, not a finding: symbols this run kept out of the dead-code kind only because a table, "
+                             "field, argument or registering decorator holds them as a VALUE (matched by name; it is not a proven call; the callers "
+                             "verb lists the sites; @classmethod-style wrappers do not count), "
+                             "the --dead-code verb's own rule. Never gates; absent at zero. " );
+    }
 
     // (3) the two identity re-filings, each keyed to the attribute family it defines. The second is
     // git-INDEPENDENT, so it is a separate condition rather than a clause of the first.
@@ -872,6 +905,14 @@ inline void emitQualityDeltaLegend( const QualityDeltaLegendParts& p )
         if( anyCloneRow( p.rows ) || anyCloneRow( p.disclosedRows ) )
         {
             std::fputs( kQdCloneLegend, stdout );
+        }
+        if( anyMinorMaskRow( p.rows ) || anyMinorMaskRow( p.disclosedRows ) )
+        {
+            rw::emitRaw( stdout, kQdMaskReportOnlyLegend );
+        }
+        if( anyPlaceholderRow( p.rows ) || anyPlaceholderRow( p.disclosedRows ) )
+        {
+            rw::emitRaw( stdout, kQdPlaceholderLegend );
         }
     }
 
@@ -1488,7 +1529,8 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
             const std::string headBasisJson = ( basis.headBasis == nullptr ? std::string()
                                               : std::string( ",\"head_basis\":\"" ) + basis.headBasis + "\"" )
                                             + ( basis.declinedCallExcluded == 0 ? std::string()   // the XML twin's declined-call-excluded=, absent at zero
-                                              : ",\"declined-call-excluded\":" + std::to_string( basis.declinedCallExcluded ) );
+                                              : ",\"declined-call-excluded\":" + std::to_string( basis.declinedCallExcluded ) )
+                                            + rw::countFieldOrEmpty( "value-ref-excluded", basis.valueRefExcluded, /*json=*/true );
             rw::emitTo( stdout, "{{\"baseline\":\"{}\",\"regressions\":{},\"minor\":{},\"acked\":{},\"stale\":{},"
                          "\"preexisting-worse\":{},\"new-symbol\":{},\"gating\":{},\"register-macro-excluded\":{},\"api-new-surface\":{},\"at\":{}{}{}{}{}{}{},\"r\":[",
                          jsonStr( baseMarkerJ ).c_str(), regs.size(), minorCount, ackedCount, staleAcks.size(),
@@ -1590,7 +1632,7 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         emitQualityDeltaLegend( { baseSel.marker, refPair, identityAttrs, !saRows.empty(), ackedCount > 0,
                                   basis.registerMacroExcluded > 0, configDiag.total() > 0, regs, outOfScope,
                                   scope.active() || !foreignAcks.empty(), !foreignAcks.empty(), baselineAbsorbed,
-                                  basis.headBasis, basis.declinedCallExcluded > 0 } );
+                                  basis.headBasis, basis.declinedCallExcluded > 0, basis.valueRefExcluded > 0 } );
         const char* baseMarker = baseSel.marker;    // R3: ditto — one seam decides staleness AND names it
         // 2026-09-06: what the sidecar readers skipped, on the root (absent means none) — see kQdBaseHeadUnreadable
         std::string sidecarHealthAttrs;
@@ -1600,6 +1642,7 @@ std::optional<int> runQualityDelta( const MainDispatch& d )
         // marker named on its own before this attribute existed.
         if( basis.headBasis != nullptr )  { sidecarHealthAttrs += std::string( " head_basis=\"" ) + basis.headBasis + "\""; }
         if( basis.declinedCallExcluded > 0 ) { sidecarHealthAttrs += " declined-call-excluded=\"" + std::to_string( basis.declinedCallExcluded ) + "\""; }
+        sidecarHealthAttrs += rw::countAttrXmlOrEmpty( "value-ref-excluded", basis.valueRefExcluded );   // absent at zero, beside its sibling
         // at= anchors this regression list to the commit (+dirty state) it was computed against.
         rw::emitTo( stdout, "<quality-delta baseline=\"{}\" regressions=\"{}\" minor=\"{}\" acked=\"{}\" stale=\"{}\" preexisting-worse=\"{}\" new-symbol=\"{}\" gating=\"{}\" register-macro-excluded=\"{}\" api-new-surface=\"{}\"{}{}{}{}{}{}{}>",
                      baseMarker, regs.size(), minorCount, ackedCount, staleAcks.size(), preexistingCount, newSymbolCount, gatingCount, basis.registerMacroExcluded, basis.apiNewSurface,
@@ -1738,7 +1781,8 @@ std::optional<int> runDmm( const MainDispatch& d )
     const dmm::Result r = dmm::computeDmm( d.root, cfg.dmmRange, d.ing, cfg.excludes, cfg.maxFileBytes );
     if( r.status == dmm::Status::BadRev )
     {
-        rw::emitTo( stderr, "ripwire: --dmm: '{}' does not resolve to a commit in {}\n", r.badToken.c_str(), d.root.c_str() );
+        rw::emitTo( stderr, "ripwire: --dmm: '{}' does not resolve to a commit in {}{}\n", r.badToken.c_str(), d.root.c_str(),
+                      rw::gitstamp::shallowRefHint( d.root ) );   // 0.6.7: the likeliest cause on a depth-limited clone, "" otherwise
         return 1;
     }
     if( r.status == dmm::Status::BadRange )
@@ -1973,6 +2017,10 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             return quality::startsWithRegisteredMacro( std::string_view( src ).substr( symbol.sigStartByte ), registerMacroNames );
         };
         std::size_t registerMacroExcluded = 0;   // P2.2: disclosed count — see the header comment below
+        std::size_t runnerRootExcluded    = 0;   // 0.6.6 D4: disclosed count (runner-root-excluded=, absent at 0)
+        std::size_t decoratedExcluded     = 0;   // 0.6.6 D4 review: decorated Python defs, counted apart (decorated-excluded=)
+        std::size_t valueRefExcluded      = 0;   // reference-as-value round: held as a VALUE by a table/field/argument (value-ref-excluded=)
+        const rw::ValueRefIndex dcVri( ing );    // valuerefs.h — the same rows --callers shows, under its visibility rules
 
         // Optional path filter (--dead-code=DIR). §P0.3: this was a bare SUFFIX test, so it could only ever
         // match a FILENAME — every directory argument produced count="0" with confidence="high", and a typo'd
@@ -2054,6 +2102,22 @@ std::optional<int> runQualityViews( const MainDispatch& d )
                 ++registerMacroExcluded;   // P2.2: self-registers via a static initializer — never dead-code
                 continue;
             }
+            if( quality::pythonDecoratedDef( s, sourceFor( s.fileId ) ) )
+            {
+                ++decoratedExcluded;   // 0.6.6 D4: decorated — a decorator may register it; its only "linkage" was a token
+                continue;
+            }
+            if( quality::pythonRunnerRoot( ing.files[ s.fileId ], s, sourceFor( s.fileId ) ) )
+            {
+                ++runnerRootExcluded;   // 0.6.6 D4: a test runner reaches it — never dead-code
+                continue;
+            }
+            // One entity, one reason: checked LAST, so a def a reason above already excluded is counted there only.
+            if( dcVri.isValueReferenced( s.id ) )
+            {
+                ++valueRefExcluded;     // a dispatch table / field / argument holds it — not dead, not a proven call either
+                continue;
+            }
             candidates.push_back( s.id );
         }
 
@@ -2085,7 +2149,19 @@ std::optional<int> runQualityViews( const MainDispatch& d )
                      "config-warnings= counts two DISCLOSED .ripwire_config problems, each also written to stderr — an "
                      "unrecognized key, and a register_macros= name matching no indexed symbol — never gating, present "
                      "only when non-zero. "
-                     "Graph evidence is local to the indexed tree; verify before deleting. {}-->", rw::graphCountFloorBrief( g.unindexedFiles > 0 ).c_str() );
+                     "runner-root-excluded= counts Python defs excluded because a test runner reaches them (pytest "
+                     "test*/xunit hooks in test_*.py or *_test.py; test*/setUp-family methods of a class whose own bases name a "
+                     "TestCase); decorated-excluded= counts decorated Python defs, excluded because a decorator MAY register "
+                     "them (wrappers such as @staticmethod/@property/@lru_cache are included, and register nothing): Python has "
+                     "no internal linkage, so such a row rested on a `static` token alone. Both are FLOORS, never findings, "
+                     "absent at 0. A `static` inside a comment is not linkage evidence. "
+                     "Graph evidence is local to the indexed tree; verify before deleting. {}{}-->",
+                     // Reference-as-value round: beside its hyphenated siblings above, exactly when the root carries it.
+                     valueRefExcluded > 0 ? "value-ref-excluded=N (absent when 0): internal functions kept off this list because a table, "
+                                            "field or argument holds them as a VALUE (matched by name; it is not a proven call; the callers verb "
+                                            "lists the sites). One entity, one reason: a def a reason above already excluded is counted there only. "
+                                          : "",
+                     rw::graphCountFloorBrief( rw::graphGaugeClauses( g ) ).c_str() );
         // §P15/§P16: candidates is already deterministically sorted (path asc, line asc, name asc) and used to
         // print every candidate unconditionally — completeness was the whole contract, matching --uses' shape,
         // so it pages the same way: no historic display cap, discloseCap=false (un-paginated tag byte-identical).
@@ -2100,8 +2176,12 @@ std::optional<int> runQualityViews( const MainDispatch& d )
             std::vector<char> dcFiltEsc;
             dcFilterAttr = " filter=\"" + std::string( escapeXml( cfg.deadCodeDir, dcFiltEsc ) ) + "\"";
         }
-        rw::emitTo( stdout, "<dead-code count=\"{}\" evidence=\"internal-linkage+zero-callers\" register-macro-excluded=\"{}\"{}{}{}{}{}>",
-                     candidates.size(), registerMacroExcluded,
+        // 0.6.6 D4: runner-root-excluded= is absent at 0, so a tree with no Python test/decorated root is byte-identical
+        const std::string runnerRootAttr = ( runnerRootExcluded == 0 ? std::string() : std::format( " runner-root-excluded=\"{}\"", runnerRootExcluded ) )
+                                         + ( decoratedExcluded == 0 ? std::string() : std::format( " decorated-excluded=\"{}\"", decoratedExcluded ) )
+                                         + ( valueRefExcluded == 0 ? std::string() : std::format( " value-ref-excluded=\"{}\"", valueRefExcluded ) );
+        rw::emitTo( stdout, "<dead-code count=\"{}\" evidence=\"internal-linkage+zero-callers\" register-macro-excluded=\"{}\"{}{}{}{}{}{}>",
+                     candidates.size(), registerMacroExcluded, runnerRootAttr,
                      dcFilterAttr.c_str(),
                      pageDisclosure( dcAb, sizeof( dcAb ), dcPw.end - dcPw.begin, candidates.size(), dcPw.end,
                                      cfg.pageLimit, cfg.pageOffset, false ),
@@ -2212,7 +2292,9 @@ std::optional<int> runEditCheck( const MainDispatch& d )
         return 1;
     }
 
-    const std::vector<EditCheckGroup> groups = editCheckGroups( ing, d.g, matches );
+    // the C/C++ declaration/definition fold is the post-hoc verb's (editcheck.h editCheckFoldDeclGroups); the preview
+    // below splices over ONE definition span, so it keeps one group per (file, scope) and refuses as before
+    const std::vector<EditCheckGroup> groups = editCheckGroups( ing, d.g, matches, /*foldDecls=*/!editPreviewRequested( cfg ) );
     if( groups.size() > 1 )
     {
         rw::emitTo( stderr, "ripwire: --edit-check: {}\n",

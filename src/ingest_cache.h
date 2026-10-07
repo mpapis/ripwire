@@ -51,6 +51,8 @@ struct RawDef
                                    //   C++ method inside one); 0 ⇒ no recovery claim. Feeds the `error` reason at load.
     std::uint8_t  internalLinkage = 0;   // C/C++: anonymous-namespace or namespace-scope `static` def (model.h Symbol::internalLinkage)
     std::uint8_t  scopeRootsStd = 0;     // #150: 1 ⇒ this def's full enclosing-namespace chain roots at std (model.h Symbol::scopeRootsStd)
+    std::uint32_t fnScopeStart = 0;      // a FUNCTION-LOCAL def (ingest_names.h enclosingFunctionScope): the byte span of the
+    std::uint32_t fnScopeEnd   = 0;      //   function whose body binds its name; End 0 ⇒ not function-local (model.h fnLocalScopes)
     SymKind       kind      = SymKind::Other;
     Lang          lang      = Lang::Unknown;
     std::string   name;
@@ -75,12 +77,14 @@ struct RawRef
     bool          viaArrow  = false;   // a C++/ObjC call: the member access was written `->`. A compose ref: `name` is the POINTEE
                                        //   of a std smart pointer member, which only `->` reaches (see Reference::viaArrow)
     bool          qualifierRootsStd = false;   // #150: the FULL written qualifier chain is rooted at namespace std (model.h Reference::qualifierRootsStd)
+    bool          memberCall = false;   // FE-A: a Go/JS/TS/Rust call written on a receiver (`x.f()`), whose recv stays None (model.h Reference::memberCall)
     std::string   name;
     std::string   qualifier;           // explicit scope at a call site (`A` in `A::b()`); C++; "" if bare/method
     std::string   recvVar;             // receiver variable when recv==NamedVar/FieldOfVar (`x` in `x->m()`); Rule 2 fuel
     std::string   fieldName;           // member variable name when isCompose (e.g. "m_pool"); ALSO the intermediate
                                        //   field of a depth-2 chained receiver (recv FieldOfThis/FieldOfVar); "" otherwise
     std::string   composeRel;          // "creates" (value/inline) or "uses" (reference/pointer) when isCompose; "" otherwise
+    std::string   memberRoot;          // FE-A: the receiver chain's ROOT identifier when memberCall (`JSON` in `JSON.parse()`); see model.h
 };
 
 // P2-D Rule 2 raw local-variable type binding (pre-attribution). startByte sits inside the enclosing
@@ -130,7 +134,26 @@ constexpr std::uint32_t kCacheMagic   = 0x4b505443;   // "CTPK"
 //   all match) rather than silently re-absolutizing a key that was never root-relative to begin
 //   with — a v2 cache simply misses on every lookup that survives the guard, which is exactly the
 //   self-healing full-reparse path already used for any other corrupt/stale cache.
-constexpr std::uint32_t kCacheVersion = 25;           // 25: #150 AND #157 (train 18 carries both bumps as ONE 24 -> 25:
+constexpr std::uint32_t kCacheVersion = 28;           // 28: FE-A (test/falseedgecheck.sh) — RawRef gains `memberCall` (u8) and
+                                                      //    `memberRoot` (str) after `qualifierRootsStd` (ref record 41 -> 46
+                                                      //    bytes lean). A FORMAT change: a v27 blob lacks the bytes, so the
+                                                      //    version guard rejects it (self-healing full reparse).
+                                                      // 27: same record layout as 26, new VALUES — the lane's second
+                                                      //    round changed which defs record fnScopeStart/End (the
+                                                      //    scope search descends to the OUTER def node, and
+                                                      //    kEscapingNestedBindings keeps globally-binding nested
+                                                      //    functions out). A 26 blob would serve the old spans
+                                                      //    (every top-level C/C++ function "nested in itself",
+                                                      //    PHP/Lua globals yielding) until its files changed.
+                                                      // 26: a FUNCTION-LOCAL def records the span of the function
+                                                      //    whose body binds its name — RawDef gains `fnScopeStart`
+                                                      //    and `fnScopeEnd` (two u32 after `scopeRootsStd`, def
+                                                      //    record 80 -> 88 bytes lean), read by graph.h's
+                                                      //    reachableByName (test/fnliteralcheck.sh §6). A FORMAT
+                                                      //    change: a v25 blob lacks the bytes, so the version
+                                                      //    guard rejects it (self-healing full reparse).
+                                                      //    kParserVer stays 128 (unreleased, same lane).
+                                                      // 25: #150 AND #157 (train 18 carries both bumps as ONE 24 -> 25:
                                                       //    neither lane's 25 reached main or a release).
                                                       //    #150 — nested std::-namespace resolution. RawDef gains
                                                       //    `scopeRootsStd` (a u8 after `internalLinkage`, def record
@@ -279,14 +302,16 @@ constexpr std::uint32_t kCacheVersion = 25;           // 25: #150 AND #157 (trai
                                                       //    (Py `pkg.mod`, TS `./x`, Rust `crate::a::b`/`mod:x`) —
                                                       //    a target FORMAT change → old caches must be rejected.
                                                       // 4: Include gained a `bool isAngle` (quote/angle) field
-constexpr std::uint32_t kParserVer    = 126;          // bump on any grammar/.scm/extraction change
-                                                      // 126 = the Rails schema-column capture
+constexpr std::uint32_t kParserVer    = 144;          // bump on any grammar/.scm/extraction change
+                                                      // 144 = 2026-10-07 (#339; carried as 126 on the PR — this merge renumbers to
+//   144 because trains 22-25 landed 128-143): the Rails schema-column capture
                                                       //   (test/rubyschemacheck.sh, unreleased; reviewed round at
                                                       //   123/126 — carried 122 pre-rebase, renumbered once for the
                                                       //   train-20 .astro collision and again to 126 at the
-                                                      //   maintainer's request: 123 is reserved for #325, 124 =
-                                                      //   #220 part 2 on main, 125 queued for #338; 126 is final,
-                                                      //   confirmed at the 0e5fdcd2 merge): a Ruby file whose tree
+                                                      //   maintainer's request: 123 reserved for #325, 125 = #338
+                                                      //   (train 22); 126/127 stayed for community PRs, but trains
+                                                      //   22-25 landed 128-143, so the 0e5fdcd2 merge kept 126 and
+                                                      //   THIS merge renumbers 144): a Ruby file whose tree
                                                       //   holds a `create_table "x", … do |t| … end` call is a
                                                       //   rendered db/schema.rb BY CONTENT, and every
                                                       //   `t.<type> "name"` / `t.<type> :name` in the table block
@@ -310,6 +335,83 @@ constexpr std::uint32_t kParserVer    = 126;          // bump on any grammar/.sc
                                                       //   change: kCacheVersion stays, kQSnapCacheScheme stays.
                                                       //   A 122/123/124/125 cache differs only in the schema
                                                       //   defs and Section-Ruby edges it lacks.
+
+                                                      // 143 = 2026-10-04 (train 25 review fixes): two extraction changes —
+                                                      //   a declaration named like the global object (`var self = this`, a
+                                                      //   parameter `window`) is now a JsShadow binding, and a value-reference
+                                                      //   slot text (into=/through=) is cut on a UTF-8 boundary, gets "…" only
+                                                      //   when really cut, and a JS string key is capped too. 143, not 142:
+                                                      //   141's RICH file tag was 142 (parserVerFor below adds 1), and a lean
+                                                      //   142 would have read those blobs as its own.
+                                                      // 141 = 2026-10-04 (train 25): cache-key hygiene above every branch build's number.
+                                                      //   Two merged lanes changed extraction under their own numbers: FE-A 134/135
+                                                      //   (member-call shape, ModuleAlias bindings, Rust path calls; kCacheVersion 28)
+                                                      //   and refval-edges 140 (reference-as-value rows; kQSnapCacheScheme 17); main
+                                                      //   was 133. 141 is above all of them, so no cache a branch build wrote is ever
+                                                      //   read as this build's. kCacheVersion stays FE-A's 28: every ingest key also
+                                                      //   carries kParserVer (lean 141 / rich 142 file tags, and a refval-edges rich
+                                                      //   blob was c27p141 — a different format number, so never this build's c28p141).
+                                                      // 140 = lane refval-edges (reference-as-value round): RefRole::Value /
+                                                      //    RefRole::Through rows from ingest_valuerefs.h, in BOTH families.
+                                                      //    A lane-local number above train 24's 133 — the train renumbers.
+                                                      // 135 = 2026-10-03 (lane FE-A fix round): Rust path calls (`<T as Trait>::f()`) are member
+                                                      //   calls — an extraction change; this lane's own earlier binaries ran 134 with the old
+                                                      //   extraction, so their caches must never be read as this build's.
+                                                      // 134 = 2026-10-03 (lane FE-A, test/falseedgecheck.sh): Go/JS/TS/Rust member calls
+                                                      //   record memberCall/memberRoot; JS/TS `require`, namespace-import and
+                                                      //   global-destructure aliases and Go import specs are ModuleAlias bindings; JsShadow
+                                                      //   also covers declarations spelled like a JS global (externalnames.h tables — a
+                                                      //   table edit is an extraction change). 133 is train 24's; the train renumbers.
+                                                      // 133 = 2026-10-02 (train 24): cache-key hygiene above every branch build's number. Two
+                                                      //   merged lanes changed extraction under their own numbers: 130 (a body-less C/C++
+                                                      //   enum/struct/union/class specifier in a function signature keeps its own span, so
+                                                      //   record VALUES change) and 131 (TS/TSX `await f<T>(x)` and unary `!f<T>(x)` are call
+                                                      //   references: new records); 132 was train 23's. 133 is above all of them, so no cache a
+                                                      //   branch build wrote is ever read as this build's. Same layout: kCacheVersion stays 27,
+                                                      //   kQSnapCacheScheme stays 16.
+                                                      // 132 = 2026-10-02 (train 23): cache-key hygiene, not an extraction change. Every
+                                                      //   branch build of this train's work ran at 129, and unmerged branch builds already
+                                                      //   ran at 130 and 131 with different extraction; 132 is above all of them, so no
+                                                      //   cache one of those builds wrote is ever read as this build's. Same layout:
+                                                      //   kCacheVersion stays 27, kQSnapCacheScheme stays 16.
+                                                      // 129 = 2026-09-30 (train 22): ONE bump past fn-literal's 128 for the two community
+                                                      //   PRs that merge after it — #338 (RSpec described_class, its 125 note below) and #325
+                                                      //   (Ruby inheritance edges, its note below). Each note keeps the number its PR carried.
+                                                      //   Record values change for Ruby only; kCacheVersion stays 27.
+                                                      // 129 (#325, train 22) = 2026-09-30 (Ruby inheritance edges, test/rubyinheritcheck.sh; carried as
+                                                      //   98 and 99 on the PR): isBaseTypeNodeIn gains a Ruby arm ((constant)/(scope_resolution)), so
+                                                      //   `class Child < Parent` emits an inherit RawRef (role Extends) where it emitted none, and
+                                                      //   captureBases does not descend into a computed superclass (`Struct.new( :a )` mints no ref to
+                                                      //   its receiver). New records, same layout: kCacheVersion unchanged (27; NOT the PR's 22/24);
+                                                      //   kQSnapCacheScheme unchanged. A Ruby cache written before this holds no inheritance refs.
+                                                      // 128 = 2026-09-29 (test/fnliteralcheck.sh): a name bound
+                                                      //   to a function literal (JS/TS `const f = (x) => …`, Lua
+                                                      //   `M.f = function … end`, a Python class-body lambda) owns
+                                                      //   the LITERAL's body (ingest_relations.h kFnLiteralBinding):
+                                                      //   bodyByte/sigEnd, params/cx/nest from the literal, and a
+                                                      //   multi-name binding's span narrows to its own binding.
+                                                      //   123/125/126/127 stay reserved for community PRs.
+                                                      //   Same lane, still 128: a function-local def's scope
+                                                      //   span (ingest_names.h enclosingFunctionScope) — a record
+                                                      //   layout change, so kCacheVersion 25 -> 26 rejects every
+                                                      //   older blob, including one this lane's first build wrote.
+                                                      // 125 = 2026-09-27 (#338, test/rubydescribedclasscheck.sh): RSpec's
+                                                      //   `described_class` receiver is classified as the constant
+                                                      //   the innermost constant-described example group names
+                                                      //   (ingest_binds.h::rspecDescribedClass), so RawRef::recv /
+                                                      //   recvVar change VALUE for those call sites — NamedVar
+                                                      //   "Calc" where they were NamedVar "described_class". Carried
+                                                      //   as 121 on the PR; renumbered 125 after #310 (121), #320
+                                                      //   (122) and #220 (124), with 123 reserved for #325. No record
+                                                      //   layout change: kCacheVersion stays 25 (NOT 24); a Ruby cache
+                                                      //   written at 124 holds the old receiver and must re-parse.
+                                                      // 124 = 2026-09-26 (#220 part 2, test/depsprecisecheck.sh
+                                                      //   P2-O): a TS/JS RE-EXPORT (`export … from './y'`) is an
+                                                      //   Include like an import (ingest_relations.h
+                                                      //   directiveTargetOf's export_statement branch), so a
+                                                      //   barrel's edges exist. 123 stays reserved for #325.
+                                                      //   No record layout change: kCacheVersion stays 25 (NOT 24);
+                                                      //   kQSnapCacheScheme stays 14.
                                                       // 122 = 2026-09-25 (#320/#67, test/astrocheck.sh): .astro joins
                                                       //   kLangTable on the TypeScript grammar, parsed through ONE
                                                       //   included range over its `---` frontmatter; blank lines
@@ -1656,8 +1758,7 @@ static_assert( std::size( kCacheRejectNames ) == static_cast<std::size_t>( Cache
 
 inline const char* cacheRejectName( CacheReject r ) noexcept
 {
-    const std::size_t i = static_cast<std::size_t>( r );
-    return i < std::size( kCacheRejectNames ) ? kCacheRejectNames[i] : "corrupt-frame";
+    return enumTableAt( kCacheRejectNames, r, "corrupt-frame" );   // infra/enumcount.h: the shared bounded table lookup
 }
 
 // A validated, still-open v15 blob: everything a caller needs to pull records out of it by pathHash.
@@ -1978,7 +2079,7 @@ inline unsigned lexDictIndexWidth( std::size_t dictCount ) noexcept
 }
 inline void writeDef( ByteW& w, const RawDef& d, bool withLex, std::size_t fileDictCount, const std::uint32_t* rowDictIndex )
 {
-    w.u32( d.line ); w.u32( d.startByte ); w.u32( d.endByte ); w.u32( d.nameByte ); w.u32( d.bodyByte ); w.u32( d.cx ); w.u32( d.ccx ); w.u32( d.loc ); w.u32( d.locals ); w.u32( d.ppAlt ); w.u32( d.humps ); w.u32( d.deepLoc ); w.u32( d.ev ); w.u32( d.params ); w.u8( d.maxNest ); w.u8( d.arityExact ); w.u8( d.testScope ); w.u8( d.recovered ); w.u8( d.internalLinkage ); w.u8( d.scopeRootsStd ); w.u8( std::uint8_t( d.kind ) ); w.u8( std::uint8_t( d.lang ) ); w.str( d.name ); w.str( d.scope );
+    w.u32( d.line ); w.u32( d.startByte ); w.u32( d.endByte ); w.u32( d.nameByte ); w.u32( d.bodyByte ); w.u32( d.cx ); w.u32( d.ccx ); w.u32( d.loc ); w.u32( d.locals ); w.u32( d.ppAlt ); w.u32( d.humps ); w.u32( d.deepLoc ); w.u32( d.ev ); w.u32( d.params ); w.u8( d.maxNest ); w.u8( d.arityExact ); w.u8( d.testScope ); w.u8( d.recovered ); w.u8( d.internalLinkage ); w.u8( d.scopeRootsStd ); w.u32( d.fnScopeStart ); w.u32( d.fnScopeEnd ); w.u8( std::uint8_t( d.kind ) ); w.u8( std::uint8_t( d.lang ) ); w.str( d.name ); w.str( d.scope );
     for( const std::uint8_t tagCount : d.evWhy ) { w.u8( tagCount ); }   // 8×u8, fixed order (model.h kEvWhyTagTable)
     if( withLex )
     {
@@ -2063,7 +2164,7 @@ inline void writeDef( ByteW& w, const RawDef& d, bool withLex, std::size_t fileD
         }
     }
 }
-inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8( std::uint8_t( r.lang ) ); w.str( r.name ); w.u8( r.isInherit ? 1 : 0 ); w.u8( r.isDocLink ? 1 : 0 ); w.str( r.qualifier ); w.u8( std::uint8_t( r.recv ) ); w.str( r.recvVar ); w.u8( r.isCompose ? 1 : 0 ); w.str( r.fieldName ); w.str( r.composeRel ); w.u8( std::uint8_t( r.role ) ); w.u32( r.line ); w.u32( r.argCount ); w.u8( r.argCountKnown ? 1 : 0 ); w.u8( r.viaArrow ? 1 : 0 ); w.u8( r.qualifierRootsStd ? 1 : 0 ); }
+inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8( std::uint8_t( r.lang ) ); w.str( r.name ); w.u8( r.isInherit ? 1 : 0 ); w.u8( r.isDocLink ? 1 : 0 ); w.str( r.qualifier ); w.u8( std::uint8_t( r.recv ) ); w.str( r.recvVar ); w.u8( r.isCompose ? 1 : 0 ); w.str( r.fieldName ); w.str( r.composeRel ); w.u8( std::uint8_t( r.role ) ); w.u32( r.line ); w.u32( r.argCount ); w.u8( r.argCountKnown ? 1 : 0 ); w.u8( r.viaArrow ? 1 : 0 ); w.u8( r.qualifierRootsStd ? 1 : 0 ); w.u8( r.memberCall ? 1 : 0 ); w.str( r.memberRoot ); }
 
 // loadCache's countFits() bounds a corrupt on-disk record COUNT against remaining bytes /
 // minRecordBytes BEFORE reserve() — the guard that keeps a hostile blob's 0xFFFFFFFF count from reaching
@@ -2077,16 +2178,18 @@ inline void   writeRef( ByteW& w, const RawRef& r ) { w.u32( r.startByte ); w.u8
 // added one u8 in the run — 12 -> 13 u8, so 56 + 13 + 8 = 77; the extent-honesty `recovered` bit then added
 // one more u8 in the run — 13 -> 14 u8, so 56 + 14 + 8 = 78; the internal-linkage bit then added one more u8 in
 // the run — 14 -> 15 u8, so 56 + 15 + 8 = 79; #150's `scopeRootsStd` bit then added one more u8 in the run —
-// 15 -> 16 u8, so 56 + 16 + 8 = 80); the RICH (withLex) extra is
+// 15 -> 16 u8, so 56 + 16 + 8 = 80; the function-local scope span then added two u32 after the u8 run — 14 -> 16
+// u32, so 64 + 16 + 8 = 88); the RICH (withLex) extra is
 // dlWeighted u32 + tokenCount u32 + tfWidth u8 = 9 bytes. A ref record is 3 u32 + 8 u8 + 5 empty
 // str(len u32) fields = 3*4 + 8*1 + 5*4 = 40 bytes (39 until the `viaArrow` u8, kCacheVersion 23; #150's
-// `qualifierRootsStd` u8 then added a 9th u8 — 40 -> 41, kCacheVersion 25).
+// `qualifierRootsStd` u8 then added a 9th u8 — 40 -> 41, kCacheVersion 25; FE-A's `memberCall` u8 and `memberRoot`
+// str then added a 10th u8 and a 6th str — 41 -> 46, kCacheVersion 28).
 // verifyCacheRecordMinimaTripwire() below derives these
 // same numbers from the REAL writer functions at runtime so the next field added to writeDef/writeRef
 // can't silently stale them.
-inline constexpr std::size_t kMinDefRecordBytesLean      = 80;   // 14×u32 + 16×u8 + 2×str(len u32, empty)
+inline constexpr std::size_t kMinDefRecordBytesLean      = 88;   // 16×u32 + 16×u8 + 2×str(len u32, empty)
 inline constexpr std::size_t kMinDefRecordBytesRichExtra =  9;   // v10 rich withLex extra: dlWeighted u32 + tokenCount u32 + tfWidth u8
-inline constexpr std::size_t kMinRefRecordBytes          = 41;   // 3×u32 + 9×u8 + 5×str(len u32, empty)
+inline constexpr std::size_t kMinRefRecordBytes          = 46;   // 3×u32 + 10×u8 + 6×str(len u32, empty)
 
 inline std::size_t minDefRecordBytes( bool captureValueUses ) noexcept
 {
@@ -2114,7 +2217,7 @@ inline void verifyCacheRecordMinimaTripwire() noexcept
 
 inline RawDef readDef( ByteR& r, bool withLex, const std::vector<std::uint64_t>& fileDict )
 {
-    RawDef d; d.line = r.u32(); d.startByte = r.u32(); d.endByte = r.u32(); d.nameByte = r.u32(); d.bodyByte = r.u32(); d.cx = r.u32(); d.ccx = r.u32(); d.loc = r.u32(); d.locals = r.u32(); d.ppAlt = r.u16Of32(); d.humps = r.u16Of32(); d.deepLoc = r.u16Of32(); d.ev = r.u16Of32(); d.params = r.u16Of32(); d.maxNest = r.u8(); d.arityExact = r.u8(); d.testScope = r.u8(); d.recovered = r.u8(); d.internalLinkage = r.u8(); d.scopeRootsStd = r.u8(); d.kind = r.enumU8<SymKind>( kSymKindCount ); d.lang = r.enumU8<Lang>( kLangCount ); d.name = r.str(); d.scope = r.str();
+    RawDef d; d.line = r.u32(); d.startByte = r.u32(); d.endByte = r.u32(); d.nameByte = r.u32(); d.bodyByte = r.u32(); d.cx = r.u32(); d.ccx = r.u32(); d.loc = r.u32(); d.locals = r.u32(); d.ppAlt = r.u16Of32(); d.humps = r.u16Of32(); d.deepLoc = r.u16Of32(); d.ev = r.u16Of32(); d.params = r.u16Of32(); d.maxNest = r.u8(); d.arityExact = r.u8(); d.testScope = r.u8(); d.recovered = r.u8(); d.internalLinkage = r.u8(); d.scopeRootsStd = r.u8(); d.fnScopeStart = r.u32(); d.fnScopeEnd = r.u32(); d.kind = r.enumU8<SymKind>( kSymKindCount ); d.lang = r.enumU8<Lang>( kLangCount ); d.name = r.str(); d.scope = r.str();
     for( std::uint8_t& tagCount : d.evWhy ) { tagCount = r.u8(); }   // mirrors writeDef's fixed 8×u8 order
     if( withLex && r.ok )
     {
@@ -2194,7 +2297,7 @@ inline RawDef readDef( ByteR& r, bool withLex, const std::vector<std::uint64_t>&
     }
     return d;
 }
-inline RawRef readRef ( ByteR& r ) { RawRef x; x.startByte = r.u32(); x.lang = r.enumU8<Lang>( kLangCount ); x.name = r.str(); x.isInherit = r.u8() != 0; x.isDocLink = r.u8() != 0; x.qualifier = r.str(); x.recv = r.enumU8<RecvKind>( kRecvKindCount ); x.recvVar = r.str(); x.isCompose = r.u8() != 0; x.fieldName = r.str(); x.composeRel = r.str(); x.role = r.enumU8<RefRole>( kRefRoleCount ); x.line = r.u32(); x.argCount = r.u16Of32(); x.argCountKnown = r.u8() != 0; x.viaArrow = r.u8() != 0; x.qualifierRootsStd = r.u8() != 0; return x; }
+inline RawRef readRef ( ByteR& r ) { RawRef x; x.startByte = r.u32(); x.lang = r.enumU8<Lang>( kLangCount ); x.name = r.str(); x.isInherit = r.u8() != 0; x.isDocLink = r.u8() != 0; x.qualifier = r.str(); x.recv = r.enumU8<RecvKind>( kRecvKindCount ); x.recvVar = r.str(); x.isCompose = r.u8() != 0; x.fieldName = r.str(); x.composeRel = r.str(); x.role = r.enumU8<RefRole>( kRefRoleCount ); x.line = r.u32(); x.argCount = r.u16Of32(); x.argCountKnown = r.u8() != 0; x.viaArrow = r.u8() != 0; x.qualifierRootsStd = r.u8() != 0; x.memberCall = r.u8() != 0; x.memberRoot = r.str(); return x; }
 inline void   writeBind( ByteW& w, const RawBind& b ) { w.u32( b.startByte ); w.u8( std::uint8_t( b.lang ) ); w.u8( std::uint8_t( b.kind ) ); w.u8( b.isFromAssignment ? 1 : 0 ); w.u32( b.spanStart ); w.u32( b.spanEnd ); w.str( b.var ); w.str( b.typeName ); w.str( b.importedName ); }
 inline RawBind readBind( ByteR& r ) { RawBind b; b.startByte = r.u32(); b.lang = r.enumU8<Lang>( kLangCount ); b.kind = r.enumU8<LocalBindKind>( kLocalBindKindCount ); b.isFromAssignment = r.u8() != 0; b.spanStart = r.u32(); b.spanEnd = r.u32(); b.var = r.str(); b.typeName = r.str(); b.importedName = r.str(); return b; }
 inline void   writeFfi( ByteW& w, const BindingAlias& a ) { w.u8( std::uint8_t( a.kind ) ); w.u8( a.lowConf ? 1 : 0 ); w.str( a.aliasName ); w.str( a.targetName ); w.str( a.targetScope ); }

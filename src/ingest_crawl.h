@@ -7,6 +7,7 @@
 #endif
 #include "infra/tablelookup.h"   // findByField — the same lookup wrap's agentTarget uses
 #include "infra/sortutil.h"      // svLess — string_view order without libstdc++'s length subtraction (#343)
+#include "memguard.h"            // #350: memguard::Watch — the crawl stops when the memory guard says so
 
 // ingest_crawl.h — crawl + parse setup, moved VERBATIM from ingest.cpp in the 2026-08-29 split: the
 // limits/skip config, the extension -> {lang, grammar, query} table (lookupLang), capture-role and
@@ -321,8 +322,11 @@ std::string lowerExtensionOf( std::string_view path )
     return ext;
 }
 
-// ---- capture-name prefix -> role. @definition.* -> DEF, @reference.* -> REF. ----
-enum class CapRole : std::uint8_t { Ignore, NameOnly, Def, Ref };
+// ---- capture-name prefix -> role. @definition.* -> DEF, @reference.* -> REF, @import.* -> IMP. ----
+// `Import` is the shared import-capture vocabulary of #358: one `@import.path` per WRITTEN specifier,
+// declared in the grammar's own tags.scm and normalised by ONE specifier normaliser per DepDialect
+// (src/ingest_importcap.h), in place of the per-language extractors this replaces.
+enum class CapRole : std::uint8_t { Ignore, NameOnly, Def, Ref, Import };
 
 // Map the part AFTER "definition."/"reference." to a SymKind. Falls back to Other.
 SymKind defKind( std::string_view tail ) noexcept
@@ -404,6 +408,7 @@ CapRole roleOf( std::string_view cap, SymKind& kindOut ) noexcept
 {
     constexpr std::string_view kDef = "definition.";
     constexpr std::string_view kRef = "reference.";
+    constexpr std::string_view kImp = "import.";
 
     if( cap == "name" )
     {
@@ -418,6 +423,12 @@ CapRole roleOf( std::string_view cap, SymKind& kindOut ) noexcept
     if( cap.size() > kRef.size() && cap.substr( 0, kRef.size() ) == kRef )
     {
         return CapRole::Ref;
+    }
+    // @import.* is tested AFTER @reference.* on purpose: the two families must stay disjoint, and an
+    // earlier arm silently swallowing an import capture would look like a working query.
+    if( cap.size() > kImp.size() && cap.substr( 0, kImp.size() ) == kImp )
+    {
+        return CapRole::Import;
     }
 
     return CapRole::Ignore;   // @doc, @local.scope, etc.
@@ -1529,8 +1540,12 @@ struct CrawlResult
     CrawlSkips                   skips;
 };
 
+// #350: `memWatch` (null = unguarded) is consulted once per directory entry — memguard::Watch decides how rarely it
+// actually measures — and a stop ends the walk where it is. What was seen so far is sorted and returned exactly as a
+// finished walk's list is, so a partial corpus is still a deterministic one; ingest() discloses the stop.
 CrawlResult collectSources( const char* rootDir, const std::vector<std::string>& excludeSubstr,
-                            std::size_t maxFileBytes, std::string_view excludeLabel = {}, bool respectGitignore = true )
+                            std::size_t maxFileBytes, std::string_view excludeLabel = {}, bool respectGitignore = true,
+                            memguard::Watch* memWatch = nullptr )
 {
     std::vector<std::string>     out;
     std::vector<SkippedOversize> skipped;
@@ -1593,8 +1608,13 @@ CrawlResult collectSources( const char* rootDir, const std::vector<std::string>&
     const fs::recursive_directory_iterator end;
     {
         PROFILE_SCOPE_DESCRIBE( "ingest/crawl: directory walk (stat + classify)" );
+        std::uint64_t entryCount = 0;
         for( ; it != end; it.increment( ec ) )
         {
+            if( memWatch != nullptr && memWatch->crawlShouldStop( entryCount++ ) )
+            {
+                break;   // #350: the memory guard's crawl line — ingest() records the stop from the watch
+            }
             if( ec )
             {
                 ec.clear();

@@ -1545,11 +1545,17 @@ void captureSideFacts( const LangEntry& le, std::uint32_t fileId, std::string_vi
         }
 #endif
 
-        if( le.lang != Lang::Elixir )
+        // Elixir directives share the lexical tags context below (ElixirContext), and as of #358 so do the
+        // C-family ones: their `@import.path` captures are normalised and emitted by captureTagsFacts, and
+        // captureIncludes no longer reads a preproc_include / preproc_call at all. The walk is pure cost
+        // for those languages — it descends only allowlisted containers, and a C-family include lives at
+        // file scope or inside a preprocessor guard, which the tags query already reaches unanchored.
+        if( le.lang != Lang::Elixir && dependencyDialect( le.lang ) != DepDialect::CFamily )
         {
-            captureIncludes( root, le.lang, fileId, src, incs, refs, binds, constOpens, shortfall );   // Elixir directives share the lexical tags context below.
+            captureIncludes( root, le.lang, fileId, src, incs, refs, binds, constOpens, shortfall );
         }
         captureJsImportFacts( root, le.lang, fileId, src, binds );
+        captureGoImportFacts( root, le.lang, fileId, src, binds );   // FE-A: Go import specs → ModuleAlias (graph.h FalseEdgeRules)
 
         // A4-R5: cross-language FFI binding declarations (pybind11 / extern "C" / ctypes handle). Inert on a
         // binding-free file (pybind gated on a file signal; extern-C/ctypes only fire on their exact shapes).
@@ -1643,6 +1649,11 @@ void captureSideFacts( const LangEntry& le, std::uint32_t fileId, std::string_vi
         }
 #endif
 
+        // Reference-as-value round: a function NAMED in a value position (an initialiser, an argument, an
+        // assignment, a decorator…) and every call THROUGH such a value. Both lean and rich families capture it —
+        // --callers/--callees/--impact/--dead-code read it — and neither role enters the call graph (model.h RefRole).
+        captureValueRefs( le.lang, fileId, src, root, refs );
+
         // #72 follow-up: everything the side passes just appended for THIS file, filtered through the one
         // decided-dead rule.
         //   refs  — captureIncludes' import sites plus the value-use / type-mention rows and the type-alias records.
@@ -1698,6 +1709,19 @@ inline void foldFieldDefs( std::vector<RawDef>& defs, std::size_t first, Lang la
     defs.resize( write );
 }
 
+// A C/C++ enum/struct/union/class SPECIFIER node — the tags query's type-definition captures. When one has no body
+// (`enum cmd_retval` as a return or parameter type) the def-span climb in captureTagsFacts must not adopt the enclosing
+// function_definition for it (comparison table tmux-07/15, test/ccheck.sh): only a function declarator owns that body.
+inline bool isCFamilyTypeSpecifier( Lang lang, TSNode node ) noexcept
+{
+    if( lang != Lang::C && lang != Lang::Cpp )
+    {
+        return false;
+    }
+    const char* t = ts_node_type( node );
+    return kindIs( t, "enum_specifier" ) || kindIs( t, "struct_specifier" ) || kindIs( t, "union_specifier" ) || kindIs( t, "class_specifier" );
+}
+
 /// Append definitions and references captured by the language query, with language-specific filtering.
 /// Captured spans refer to src and root; a null cursor appends nothing. Existing output rows are retained.
 /// `ppDead` is this file's decided-dead byte ranges (preprocDeadRangesFor, computed ONCE per file by the
@@ -1728,6 +1752,8 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
     const std::size_t firstDefOfFile = defs.size();   // member-variable round: foldFieldDefs' window (below)
     const std::size_t firstRefOfFile = refs.size();   // #72 follow-up: dropPreprocDead's window (below)
     const std::size_t firstBindOfFile = binds.size();
+    // #358: the `@import.*` window — dropPreprocDead's, now that this pass emits Includes too.
+    const std::size_t firstIncOfFile = includes.size();
 
     ElixirContext elixir;
     elixir.shortfall = &shortfall;
@@ -1825,6 +1851,15 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
 
                     case CapRole::Ignore:
                     break;
+
+                    // #358: `@import.path` — emit here, not in a second pass. Matches arrive by start byte and captures
+                    // within a match in query order, so a staging vector would produce the identical
+                    // order while costing an allocation and a drain block.
+                    case CapRole::Import:
+                    {
+                        emitCapturedImport( cap.node, fileId, le.lang, src, includes, refs, shortfall );
+                    }
+                    break;
                 }
             }
 
@@ -1901,11 +1936,14 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
             // return type + signature + body. Fixes --expand bodies, --pack-signatures return-types,
             // AND reference enclosing-attribution (a call in a body is now inside its function span).
             // Grammars whose @definition node already owns the body (class/struct/enum) don't climb.
-            TSNode defNode = roleNode;
             // defBodyNodeOf = the `body:` field, PLUS the macro-edges round's one addition: a #define's
             // replacement text (`value:` field) is adopted as a macro symbol's body, set before the climb
-            // below so the climb is skipped for macros.
-            TSNode body    = le.lang == Lang::Elixir ? elixirBody( roleNode, src ) : defBodyNodeOf( roleNode, kind );
+            // below so the climb is skipped for macros — PLUS a name bound to a function literal
+            // (kFnLiteralBinding): the literal's body, with `literal` the node params/cx/nest read from.
+            const DefBodyNodes own = le.lang == Lang::Elixir ? DefBodyNodes{ elixirBody( roleNode, src ), {}, roleNode }
+                                                              : defBodyNodeOf( roleNode, nameNode, kind, le.lang );
+            TSNode defNode = own.span;
+            TSNode body    = own.body;
             // LB-E testmacroblock: the def is TWO SIBLING nodes (see testMacroBlockPartsOf) — adopt the
             // sibling compound_statement as the body and the title literal as the name BEFORE the shared
             // span/complexity code below. The span's endByte and the loc row window are extended past
@@ -1932,6 +1970,18 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
             // No-op for every pre-existing Var capture (Swift/C#/Go/Python parents hit a scope-stop or the
             // file root before any "body"-owning ancestor — verified byte-identical on the gate corpora).
             // A Field's span is its own field_declaration / defining assignment — the Var rule, same reason.
+            // A BODY-LESS C/C++ type specifier — `enum cmd_retval` as a return type (`static enum cmd_retval⏎fn(…)`, tmux's
+            // style) or a parameter type — is captured by the tags query's bare enum/class pattern, and the climb below
+            // ADOPTED the enclosing function_definition, whose body it sits outside of: the specifier took the WHOLE
+            // function's span, so --at chained `struct cmd_retval` around the function, --grep labelled its hits
+            // in="cmd_retval" and its calls were attributed to a `struct box_lines` caller (comparison table tmux-07/15,
+            // test/ccheck.sh). The adoption is for a function DECLARATOR. A type specifier whose climb reaches a body owner
+            // it sits outside of is a type USE in that function's signature, not a definition, so it mints NO def: keeping
+            // it as a small def of its own put a span in the return-type position wholly before the name — extentsuspect.h
+            // R3's derailed-parse signature — and flagged clean functions extent_suspect="head" (review of this lane,
+            // ccheck arm (f)). The declaration-wrapper rule at a scope stop is unchanged (`enum E : int;`, a prototype).
+            const bool bodylessTypeSpec = isCFamilyTypeSpecifier( le.lang, roleNode );
+            bool       typeUseInSignature = false;
             if( ts_node_is_null( body ) && kind != SymKind::Var && kind != SymKind::Field && le.lang != Lang::Elixir )
             {
                 TSNode child = roleNode;
@@ -1977,12 +2027,18 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
                     const TSNode pb = fieldChild( p, NodeField::Body );
                     if( !ts_node_is_null( pb ) )
                     {
-                        if( !spanContains( pb, roleNode ) ) { defNode = p; body = pb; }
+                        const bool outsideBody = !spanContains( pb, roleNode );
+                        if( outsideBody && !bodylessTypeSpec ) { defNode = p; body = pb; }
+                        typeUseInSignature = outsideBody && bodylessTypeSpec;
                         break;
                     }
                     child = p;
                     p     = ts_node_parent( p );
                 }
+            }
+            if( typeUseInSignature )
+            {
+                continue;   // a body-less C/C++ specifier in a function's signature: a type use, never a definition
             }
 
             // ObjC/Kotlin body-field fallback for the grammars that expose a body as an unnamed CHILD, not a
@@ -2039,7 +2095,10 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
             const bool  fnOrMethod = ( kind == SymKind::Function || kind == SymKind::Method );
             // LB-E: for a testmacroblock the body SIBLING is where the code lives — complexityOf walks
             // INSIDE its root node, so handing it defNode (the bare macro statement) would count nothing.
-            const auto [ cxVal, ccxVal, nestVal, localsVal, ppAltVal, humpsVal, deepVal, evVal, evWhyVal ] = fnOrMethod ? complexityOf( spanThroughBody ? body : defNode, src, le.lang ) : Complexity{ 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, {} };
+            // A literal-bound name measures its LITERAL; every other def measures defNode, as before.
+            const bool   literalBound = !ts_node_is_null( own.literal );
+            const TSNode metricNode   = literalBound ? own.literal : defNode;
+            const auto [ cxVal, ccxVal, nestVal, localsVal, ppAltVal, humpsVal, deepVal, evVal, evWhyVal ] = fnOrMethod ? complexityOf( spanThroughBody ? body : metricNode, src, le.lang ) : Complexity{ 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, {} };
             d.cx        = cxVal;
             d.ccx       = ccxVal;
             d.locals    = localsVal;   // Phase 1: floor count, C/C++ only (model.h localsCountedLang) — 0 elsewhere, never emitted there
@@ -2054,10 +2113,10 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
                 const std::uint32_t endRow   = ts_node_end_point( spanThroughBody ? body : defNode ).row;   // LB-E: rows through the sibling block
                 d.loc = ( endRow >= startRow ) ? ( endRow - startRow + 1u ) : 1u;
             }
-            d.params    = fnOrMethod ? ( le.lang == Lang::Elixir ? elixirParams( defNode, src ) : countParams( defNode ) ) : std::uint16_t( 0 );
+            d.params    = fnOrMethod ? ( le.lang == Lang::Elixir ? elixirParams( defNode, src ) : paramCountOf( metricNode, literalBound ) ) : std::uint16_t( 0 );
             // LB-E: a testmacroblock's parameter surface is the MACRO's business, not visible here — claim
             // inexact so the resolver's arity narrowing never trusts params=0 on a test-title symbol.
-            d.arityExact = ( fnOrMethod && !isTestMacroBlock ) ? std::uint8_t( cc_paramArityExact( defNode, le.lang, kind ) ? 1 : 0 ) : std::uint8_t( 0 );   // B2.2
+            d.arityExact = ( fnOrMethod && !isTestMacroBlock ) ? std::uint8_t( cc_paramArityExact( metricNode, le.lang, kind ) ? 1 : 0 ) : std::uint8_t( 0 );   // B2.2
             // L8: the in-file test-scope bit, for EVERY kind (a `#[cfg(test)] mod` and a `class TestFoo`
             // are themselves symbols, and dropping the members while keeping the shell would be a worse
             // answer than either). Runs on defNode, whose ancestors are the enclosing scopes.
@@ -2112,6 +2171,19 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
             // Internal linkage (model.h Symbol::internalLinkage): C and C++ only, read off defNode — the node that owns
             // the storage class and whose ancestors are the enclosing namespaces (ingest_names.h::cppInternalLinkage).
             d.internalLinkage = internalLinkageBit( le.lang, defNode, src );
+            // A FUNCTION bound inside another function's body records that function's span (ingest_names.h
+            // enclosingFunctionScope): graph.h reachableByName ranks it below every def a call outside it can name.
+            if( kind == SymKind::Function && !bindsOutsideItsFunction( roleNode, le.lang ) )
+            {
+                // Descend to the OUTER of the two def nodes: a C-family def's defNode climbed from its declarator (the role
+                // node) to the function_definition, which must not read as the function enclosing itself; a multi-name
+                // binding's defNode narrowed to one declarator, whose declaration (the role node) holds no scope node
+                // and is not a 20k-child list to rescan per name.
+                const bool    defIsOuter = ts_node_start_byte( defNode ) <= ts_node_start_byte( roleNode ) && ts_node_end_byte( defNode ) >= ts_node_end_byte( roleNode );
+                const FnScope fnScope    = enclosingFunctionScope( root, defIsOuter ? defNode : roleNode );
+                d.fnScopeStart = fnScope.start;
+                d.fnScopeEnd   = fnScope.end;
+            }
             if( le.lang == Lang::Cpp )                              // canonical scope (E#4): out-of-line `A::b` → "A", else enclosing class/namespace
             {
                 d.scope = qualifierOfDefinition( nameNode, src );   // `Box<T>::grow` (primary) → "Box"; a specialization keeps its id
@@ -2279,6 +2351,7 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
                     r.recv = rs.kind;  r.recvVar = std::move( rs.var );                  //   → one-hop narrowing in resolve.h
                     r.fieldName = std::move( rs.field );                                 //   depth-2 intermediate field; "" otherwise
                     r.viaArrow  = rs.viaArrow;                                           //   `p->m()`: Rule 2b's smart-pointer pointee needs it
+                    r.memberCall = rs.member;  r.memberRoot = std::move( rs.root );      //   FE-A: a Go/JS/TS/Rust member call and its receiver root
                     auto [ ac, ak ] = callArity( nameNode, le.lang, src );               // B2.2: call-site positional arg count
                     r.argCount = ac;  r.argCountKnown = ak;                              //   → arity filter in graph.h
                 }
@@ -2308,10 +2381,17 @@ void captureTagsFacts( TSQueryCursor* cursor, const LangEntry& le, std::uint32_t
     // the facts spelled inside the block are dropped. Before foldFieldDefs, so the Python
     // one-field-per-(class,name) fold can never elect a definition that cannot compile.
     //
-    // BINDS / INCLUDES — this function appends to them only for Elixir (ElixirContext), a language with no
-    // preprocessor: preprocDeadRangesFor is empty there, so neither window needs the filter.
+    // BINDS / INCLUDES — this function appended to `binds` for Elixir (ElixirContext) only, and to
+    // `includes` for Elixir until #358 moved the C-family dependency edges here from captureIncludes.
+    // Elixir has no preprocessor, so its window needed no filter; C-family is the opposite case in every
+    // sense — `#include` inside `#if 0` is the shape this whole filter exists for, and it arrives through
+    // the tags query now (the query cannot know an arm is dead; that is preprocdead.h's one job). Without
+    // this line the round would have RESURRECTED every dead include: measured on the test/importcapcheck.sh
+    // fixture, the
+    // `#if 0` block's dep_dead_if.h and the `#elif 0` arm's dep_elif.h both come back as edges.
     dropPreprocDead( refs, firstRefOfFile, ppDead, refSiteByte );
     dropPreprocDead( defs, firstDefOfFile, ppDead, defSiteByte );
+    dropPreprocDead( includes, firstIncOfFile, ppDead, incSiteByte );
 
     if( le.lang == Lang::Elixir ) { elixirExpandImplementations( elixir, defs, firstDefOfFile, binds, firstBindOfFile ); }
     foldFieldDefs( defs, firstDefOfFile, le.lang );   // member-variable round: owner-less fields drop, Python fields fold to one per (class, name)

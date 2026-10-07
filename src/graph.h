@@ -23,6 +23,8 @@
 #include "pincensus.h"           // eval-only per-call-site decision census (--pin-census); inert unless armed
 #include "externalnames.h"       // Phase 5: the committed builtin/stdlib tables behind the external-name veto
 #include "infra/sortutil.h"      // radix edge sorting for large integer-key graph edge lists
+#include "clones.h"              // scanCodeTokens / CodeScanOptions — BuiltinMethodGate::namedBeyondDefinition's code-token count
+#include "infra/namesplit.h"     // isIdentChar — identifierRunCount, the identifier runs inside a string annotation
 #include "docparse.h"            // detail::readWholeFile — resolveAtSeed reads the seed line's byte range off disk
 #include "infra/profileScope.h"  // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DRIPWIRE_PROFILE=ON)
 
@@ -110,6 +112,10 @@ struct Graph
     // files call THIS symbol, which nothing in the pipeline can support. Asset extensions never enter it
     // (ingest.h's withheld list), so a .png is not disclosed as a language ripwire failed to read.
     std::size_t                unindexedFiles = 0;
+    // #325: Ruby superclass references the scoped base lookup could not place (no superclass directive at their
+    // class open), so their base stayed on the final-segment byName rule — resolve.h RubyBaseScopeDisclosure.
+    // A whole-corpus gauge beside unindexedFiles, emitted as ruby_bases_unscoped= and ABSENT AT ZERO.
+    std::size_t                rubyBasesUnscoped = 0;
     std::size_t                externalCalls = 0;   // Phase 5 (docs/EVALS.md "Phase 5"): call sites the external-name
                                                      // VETO refused — a bare name or receiver provably bound OUTSIDE the
                                                      // indexed tree (a builtin/stdlib name with no in-repo evidence, an
@@ -263,6 +269,7 @@ inline bool namespaceCompatible( RefRole role, SymKind kind ) noexcept
             return kind == SymKind::Macro;
         }
         case RefRole::Call: case RefRole::Read: case RefRole::Write: case RefRole::Import:
+        case RefRole::Value: case RefRole::Through:   // never in the call loop; graph.h valueRefIndex narrows by kind itself
         {
             return true;   // un-narrowed — see the doctrine above; a NEW role is a -Werror=switch decision here
         }
@@ -937,6 +944,66 @@ inline void collapseDeclarationsOfName( const IngestResult& ing, bool multiRoot,
     }
 }
 
+// FUNCTION-LOCAL DEFS YIELD OUTSIDE THEIR FUNCTION (every language; gate test/fnliteralcheck.sh §6).
+//
+// A function bound inside another function's body (model.h Symbol::fnLocal: `const start = () => {…}` inside a factory,
+// a nested `def`, a `const run` inside an `it()` callback) is named only inside that function: an import cannot reach
+// it, and neither can another function of the same file. From anywhere else it is reachable only as a VALUE the
+// function hands out — `return { start }`, then `tracker.start()` — which is a real call the resolver can see only by
+// name. So such a def is not DROPPED outside its function; it YIELDS: Rule 3 and the name-based ladder first run over
+// the candidates the call can reach by name, and fall back to the whole list only when that set does not decide.
+//   * Rule 3 on the reachable set first — even a lone reachable candidate, when it sits in a file the caller imports;
+//     on the whole list only when no reachable candidate does — the returned-value idiom: the caller imports the
+//     factory's module and calls a member of its result.
+//   * The ladder's same-file and same-directory tiers over the reachable set; over the whole list only when nothing
+//     reachable is left. Its unique-global tier still counts the set-aside defs: the NAME is shared, so a lone
+//     reachable survivor with no import or locality evidence declines, exactly as it did while the local competed.
+// It can never empty a candidate set nor add one the ladder would not reach, and it is inert unless a local def is out
+// of reach. Measured on a 583-file TypeScript agent repo: `tui.start()` on an imported `AgentTui` binds again (7 call
+// sites a bodied factory-local `start` had turned into declines), and a test helper's own `run` PARAMETER stops binding
+// to another test's `const run` (4 false edges). WHY NOT "a typed receiver outranks import evidence": a TS/JS member
+// call carries no receiver today (ingest_binds.h receiverOf returns None past a literal), so Rule 2 never sees
+// `tui: AgentTui`; giving it one re-reads every `recv == None` guard in this loop, a far wider change than this one.
+// WHY NOT drop the local def outside its function outright: TS/JS cannot tell `tracker.stop()` from a bare `stop()`
+// here (both None), and the drop would lose the returned-value edge while handing the call to an unrelated same-named
+// method elsewhere — the edge this rule keeps.
+inline bool localDefOutOfReach( const IngestResult& ing, NodeId c, const Reference& r ) noexcept
+{
+    const Symbol& s = ing.symbols[ c ];
+    if( s.fnLocal == 0 )
+    {
+        return false;
+    }
+    const auto row = std::lower_bound( ing.fnLocalScopes.begin(), ing.fnLocalScopes.end(), c,
+                                       []( const FnLocalScope& f, NodeId id ) noexcept { return f.id < id; } );
+    if( row == ing.fnLocalScopes.end() || row->id != c )
+    {
+        return false;   // no span recorded: claim nothing past the evidence — the def stays reachable
+    }
+    return s.fileId != r.fileId || r.startByte < row->start || r.startByte >= row->end;
+}
+
+// the candidates of `ids` a call at `r` can reach BY NAME, into `out`; true iff a function-local def was set aside AND
+// something reachable is left (only then does the caller have a narrower set to try first).
+inline bool reachableByName( const IngestResult& ing, const rw::SmallVec<NodeId, 2>& ids, const Reference& r, rw::SmallVec<NodeId, 2>& out )
+{
+    out.clear();
+    bool setAside = false;
+    for( NodeId c : ids )
+    {
+        if( localDefOutOfReach( ing, c, r ) )
+        {
+            setAside = true;
+        }
+        else
+        {
+            out.push_back( c );
+        }
+    }
+    ENSURES( out.size() <= ids.size(), "reachableByName only removes candidates" );
+    return setAside && !out.empty();
+}
+
 // JVM OWN-LANGUAGE-FIRST — the candidate filter that keeps the Kotlin<->Java bridge from deleting edges.
 //
 // langCompatible admits a Kotlin/Java pair by bare NAME. Past it, the tier ladder resolves a bare call to the same file,
@@ -1514,6 +1581,10 @@ struct ExternalVetoTables
 {
     HashMap<std::string, char>          importBind;
     HashMap<std::string, std::uint32_t> importBindFile;
+    HashMap<std::string, std::uint32_t> memberImportFile;   // FE-A: `from m import x [as y]` → "<fileId>#y" → m's ONE file (kNoFile:
+                                                            //   unresolved, or two modules bind the name); read by FalseEdgeRules only
+    std::vector<std::vector<std::uint32_t>> importFiles;    // FE-A: Python fileId → the sorted files its import directives name
+                                                            //   (Step-A, else the suffix match) — a star import's only evidence
     HashMap<std::string, char>          fileScopeDef;
     HashMap<std::string, char>          pythonModuleRebind;
     HashMap<std::string, char>          freeName;
@@ -1615,9 +1686,91 @@ inline HashMap<std::string, char> buildPythonModuleRebindVetoes( const IngestRes
 // before it ever populates `importBindFile` for a rebound name.
 struct PythonImportVetoes
 {
-    HashMap<std::string, char>          importBind;
-    HashMap<std::string, std::uint32_t> importBindFile;
+    HashMap<std::string, char>              importBind;
+    HashMap<std::string, std::uint32_t>     importBindFile;
+    HashMap<std::string, std::uint32_t>     memberImportFile;
+    std::vector<std::vector<std::uint32_t>> importFiles;
 };
+
+// FE-A: resolvePythonModuleSuffix scans every indexed path, and FE-A asks it about every UNRESOLVED absolute import (the
+// stdlib and third-party ones above all), so its answers are memoized per module spelling — per root on a multi-root run,
+// where the answer depends on the importer's root.
+struct PythonSuffixMemo
+{
+    const std::vector<std::uint32_t>*   fileRoot = nullptr;
+    HashMap<std::string, std::uint32_t> answers;
+    std::string                         key;
+    std::uint32_t resolve( std::string_view module, const HashMap<std::string, std::uint32_t>& fileIndex, std::uint32_t importer )
+    {
+        const bool scoped = fileRoot != nullptr && importer < fileRoot->size();
+        key.assign( module );
+        if( scoped )
+        {
+            key.push_back( '\x1f' );
+            Narrower::appendUint( key, ( *fileRoot )[ importer ] );
+        }
+        const auto [ it, fresh ] = answers.try_emplace( key, kNoFile );
+        if( fresh )
+        {
+            it->second = resolvePythonModuleSuffix( module, fileIndex, fileRoot, importer );
+        }
+        return it->second;
+    }
+};
+
+// FE-A: record the module FILE a `from m import x [as y]` binding names (ExternalVetoTables::memberImportFile) — Step-A's
+// `resolved`, else the absolute spec's suffix match, exactly as recordImportBindFile resolves `import m`; two different
+// modules binding one name degrade the entry to kNoFile.
+inline void recordMemberImportFile( const Binding& b, std::uint32_t resolved, const HashMap<std::string, std::uint32_t>& fileIndex, std::string& key,
+                                    HashMap<std::string, std::uint32_t>& memberImportFile, PythonSuffixMemo& memo )
+{
+    if( b.importedName == "module" || b.typeName.empty() )
+    {
+        return;
+    }
+    std::uint32_t moduleFile = resolved;
+    if( moduleFile == kNoFile && b.typeName.front() != '.' )
+    {
+        moduleFile = memo.resolve( b.typeName, fileIndex, b.fileId );
+    }
+    key.clear();  Narrower::appendUint( key, b.fileId );  key.push_back( '#' );  key.append( b.var );
+    const auto [ it, inserted ] = memberImportFile.try_emplace( key, moduleFile );
+    if( !inserted && it->second != moduleFile )
+    {
+        it->second = kNoFile;
+    }
+}
+
+// FE-A: every Python import DIRECTIVE's file, per importing file, sorted (a star import binds no name, so only the
+// directive says which module it read) — Step-A, else the memoized suffix match.
+inline std::vector<std::vector<std::uint32_t>> buildPythonImportFiles( const IngestResult& ing, const HashMap<std::string, std::uint32_t>& fileIndex,
+                                                                      PythonSuffixMemo& memo )
+{
+    std::vector<std::vector<std::uint32_t>> files( ing.files.size() );
+    for( const Include& inc : ing.includes )
+    {
+        const std::string_view from = inc.fileId < ing.files.size() ? rootRelPath( ing, inc.fileId ) : std::string_view{};
+        if( inc.target.empty() || !( from.ends_with( ".py" ) || from.ends_with( ".pyi" ) ) )
+        {
+            continue;
+        }
+        std::uint32_t f = resolvePreciseInclude( from, inc.target, /*isAngle=*/ false, fileIndex );
+        if( f == kNoFile && inc.target.front() != '.' )
+        {
+            f = memo.resolve( inc.target, fileIndex, inc.fileId );
+        }
+        if( f != kNoFile )
+        {
+            files[ inc.fileId ].push_back( f );
+        }
+    }
+    for( std::vector<std::uint32_t>& list : files )
+    {
+        std::sort( list.begin(), list.end() );
+        list.erase( std::unique( list.begin(), list.end() ), list.end() );
+    }
+    return files;
+}
 
 inline PythonImportVetoes buildPythonImportVetoes( const IngestResult& ing, const HashMap<std::string, std::uint32_t>& fileIndex,
                                                     const HashMap<std::string, char>& moduleNames,
@@ -1626,6 +1779,7 @@ inline PythonImportVetoes buildPythonImportVetoes( const IngestResult& ing, cons
     EXPECTS( !fileIndex.empty(), "buildExternalVetoTables only calls this once its own anyImport gate found ≥1 Import binding, which is what populated fileIndex" );
     PythonImportVetoes t;
     std::string        key;
+    PythonSuffixMemo   memo{ ing.fileRoot.empty() ? nullptr : &ing.fileRoot, {}, {} };
     for( const Binding& b : ing.bindings )
     {
         if( b.kind != LocalBindKind::Import || b.var.empty() || b.typeName.empty() || b.fileId >= ing.files.size() )
@@ -1656,6 +1810,7 @@ inline PythonImportVetoes buildPythonImportVetoes( const IngestResult& ing, cons
         }
         recordImportBindFile( b, resolved, fileIndex, pythonModuleRebind, key, t.importBindFile,
                               ing.fileRoot.empty() ? nullptr : &ing.fileRoot );
+        recordMemberImportFile( b, resolved, fileIndex, key, t.memberImportFile, memo );
         key.clear();  Narrower::appendUint( key, b.fileId );  key.push_back( '#' );  key.append( b.var );
         const auto [ it, inserted ] = t.importBind.try_emplace( key, verdict );
         if( !inserted && it->second == 'x' && verdict != 'x' )
@@ -1663,6 +1818,7 @@ inline PythonImportVetoes buildPythonImportVetoes( const IngestResult& ing, cons
             it->second = verdict;   // any in-repo/unknown binding of the name outranks an external one
         }
     }
+    t.importFiles = buildPythonImportFiles( ing, fileIndex, memo );
     return t;
 }
 
@@ -1731,6 +1887,8 @@ inline ExternalVetoTables buildExternalVetoTables( const IngestResult& ing )
         PythonImportVetoes iv = buildPythonImportVetoes( ing, fileIndex, moduleNames, t.pythonModuleRebind );
         t.importBind          = std::move( iv.importBind );
         t.importBindFile      = std::move( iv.importBindFile );
+        t.memberImportFile    = std::move( iv.memberImportFile );
+        t.importFiles         = std::move( iv.importFiles );
     }
     for( const Symbol& sy : ing.symbols )
     {
@@ -1751,6 +1909,15 @@ inline ExternalVetoTables buildExternalVetoTables( const IngestResult& ing )
         }
     }
     return t;
+}
+
+// "<id>#name" into the caller's reused buffer — the key the Phase-5 and FE-A tables are spelled in (no allocation).
+inline const std::string& fileNameKey( std::string& key, std::uint32_t id, std::string_view name )
+{
+    key.clear();
+    Narrower::appendUint( key, id );
+    key.append( 1, '#' ).append( name );
+    return key;
 }
 
 // ── Phase 5: the external-name VETO predicate (docs/EVALS.md "Phase 5", mechanism 1) ───────────────────
@@ -1779,19 +1946,16 @@ struct ExternalVeto
 
     bool hasLocal( const Reference& ref, std::string_view name ) const
     {
-        key.clear();  Narrower::appendUint( key, ref.fromSymbol );  key.push_back( '#' );  key.append( name );
-        return localNameSet.find( key ) != localNameSet.end();
+        return localNameSet.contains( fileNameKey( key, ref.fromSymbol, name ) );
     }
     char importVerdict( const Reference& ref, std::string_view name ) const
     {
-        key.clear();  Narrower::appendUint( key, ref.fileId );  key.push_back( '#' );  key.append( name );
-        const auto it = tables.importBind.find( key );
+        const auto it = tables.importBind.find( fileNameKey( key, ref.fileId, name ) );
         return ( it == tables.importBind.end() ) ? '\0' : it->second;
     }
     bool pythonDefEvidence( const Reference& ref ) const
     {
-        key.clear();  Narrower::appendUint( key, ref.fileId );  key.push_back( '#' );  key.append( ref.calleeName );
-        if( tables.fileScopeDef.find( key ) != tables.fileScopeDef.end() )
+        if( tables.fileScopeDef.contains( fileNameKey( key, ref.fileId, ref.calleeName ) ) )
         {
             return true;   // a same-file module-level def of the builtin's name shadows the builtin
         }
@@ -2165,7 +2329,10 @@ inline JsImportTables buildJsImportTables( const IngestResult& ing, const WsIncl
 //     FILE names that class or a class in its inheritance cone (ChaConeMemo) — defines it, or a reference there names it
 //     as callee/receiver/qualifier (constructor, annotation, import, extends, `Cls.new`), or a binding names it (type,
 //     variable, imported name), or an ES import binding there resolves to it (a default or renamed import). Else
-//     NoEvidence. A JS/TS literal receiver (`"a".split`) is a builtin by construction: Impossible.
+//     NoEvidence. A JS/TS literal receiver (`"a".split`) is a builtin by construction: Impossible. Python, a receiver
+//     other than self/cls: the class's own DEFINITION in the caller's file (its `class` statement and the VarDecl of
+//     its name) is not evidence — only a reference, binding or import naming it is (a same-file `data.get( "repos" )`
+//     bound to ConnectionPool.get before; test/builtinbindcheck.sh arm T).
 //   * a NESTED function (its innermost container is a function): reachable only by a bare call in its own file. Admit
 //     there, Impossible otherwise (no member access and no other file can name a closure).
 //   * a top-level FREE function:
@@ -2185,7 +2352,8 @@ inline JsImportTables buildJsImportTables( const IngestResult& ing, const WsIncl
 // STATED FLOORS, each measured or probed:
 //   (1) the evidence is a class NAME, as CHA-lite's is: two same-named classes share it;
 //   (2) the grain is the FILE: a builtin call in a file that also works with the in-repo class keeps its edge (the
-//       gate removes less there, never adds);
+//       gate removes less there, never adds) — in Python "works with" means names it beyond defining it, unless the
+//       receiver is self/cls;
 //   (3) a split with one evidenced arm is kept whole, false arms included;
 //   (4) an object handed to the caller with no mention of its class in the file (an unannotated parameter, dependency
 //       injection, a factory return) no longer reaches the in-repo method by name; the call is declined and counted;
@@ -2200,6 +2368,147 @@ inline JsImportTables buildJsImportTables( const IngestResult& ing, const WsIncl
 //       `Get` by name, and needs the declared-type evidence Go's extractor does not record either); C and C++ (they
 //       carry declared-type evidence, so the fix there is an evidence-AGAINST rule for a receiver of a std or builtin
 //       type, not a name list).
+// THE SAME-FILE ANNOTATION RULE (BuiltinMethodGate::fileNames, byReferenceOnly). Python records no annotation as a binding
+// or reference, so `def f( p: Pool )`, `x: Pool = …`, `"Pool"`, `Optional[Pool]`, `isinstance( o, Pool )` and `-> Pool`
+// leave fileRefClasses empty in the file that DEFINES Pool. A class the file defines still counts there when its name
+// occurs as a CODE token more often than the file defines a class of that name: a `class Pool:` line (and the
+// module-level name Python binds for it) is one token per definition, and any other code occurrence is evidence. The
+// tokens come from the house code scanner (clones.h scanCodeTokens), so a `# Pool` comment, a docstring and a `'Pool warm'`
+// or `"Pool"` string are NOT evidence (test/commenttokencheck.sh A-E: each bound a json dict's `data.get` to Pool.get when
+// the count ran over every identifier byte run in the file) — EXCEPT a string in annotation or subscript position, which
+// Python reads as a type expression: `p: "Pool"` and `x: "Pool" = …` (a `:` then the string on the same line), `-> "Pool"`,
+// `None | "Pool"` (a union member after `|`), and `Optional["Pool"]` / `type["Pool"]` / `Dict[str, "Pool"]` (directly inside
+// a `[ … ]` that follows a name, a keyword or a `]`). Those are scanned for identifier runs as the whole file once was (arm N;
+// builtinbindcheck arm T's `p: "PStr"`), and so are the `{…}` fields of an f-string (`f"{Pool}"`, arm R: Python compiles
+// them as code). A docstring follows its `:` on the NEXT line, an `__all__` tuple sits in `( … )`, a list literal's `[`
+// follows `=`, and a call argument follows `(`, so each stays prose (arm O). The scanner runs with Python's string
+// grammar: `'…'` is a string, `'''…'''` and `"""…"""` run to their closing triple so an apostrophe or a lone `"` inside a
+// docstring stays string content (arm Q), and `//` is floor division, not a comment, so `n = total // 2; kind = Pool`
+// keeps the rest of its line (arm P). Floors toward KEEPING an edge: an unreadable file admits; a dict literal's
+// `"k": "Pool"`, a lambda's `: "Pool"`, a dict lookup's `d["Pool"]` and a list after a keyword (`return ["Pool"]`) read as
+// annotations or subscripts. Floors toward DROPPING one (a true mention this count does not see): a string that is a type
+// only by its callee's convention — `cast("Pool", x)`, `TypeVar("T", bound="Pool")` — reads as a call argument; a PEP 484
+// type comment `x = make()  # type: Pool` is a comment; an annotation whose string starts on the line after its `:` is
+// prose; an f-string's literal text (`f"Pool {x}"`) is prose. The gate caches one file's bytes (its calls arrive file by file).
+inline std::size_t identifierRunCount( std::string_view text, std::string_view name ) noexcept
+{
+    std::size_t runs     = 0;
+    std::size_t runStart = 0;
+    for( std::size_t at = 0; at <= text.size(); ++at )
+    {
+        if( at < text.size() && namesplit::isIdentChar( text[ at ] ) )
+        {
+            continue;
+        }
+        runs    += ( text.substr( runStart, at - runStart ) == name ) ? 1u : 0u;
+        runStart = at + 1;
+    }
+    return runs;
+}
+
+// The identifier runs named `name` inside an f-string's `{…}` fields: `{{` is a literal brace, a field ends at the next `}`
+// (a nested `{…}` in a format spec ends it early — that spec's tail is then literal text, the keep direction either way).
+inline std::size_t interpolatedRunCount( std::string_view text, std::string_view name ) noexcept
+{
+    std::size_t runs = 0;
+    for( std::size_t open = text.find( '{' ); open != std::string_view::npos; open = text.find( '{', open ) )
+    {
+        if( open + 1 < text.size() && text[ open + 1 ] == '{' )
+        {
+            open += 2;
+            continue;
+        }
+        const std::size_t close = text.find( '}', open );
+        if( close == std::string_view::npos )
+        {
+            break;
+        }
+        runs += identifierRunCount( text.substr( open + 1, close - open - 1 ), name );
+        open  = close + 1;
+    }
+    return runs;
+}
+
+// Where the scanner's current token sits: the previous token and the open-bracket stack, enough to tell a string in
+// annotation or subscript position (a type expression) from any other string. Every token is a view into `text`.
+struct StringTokenPosition
+{
+    std::string_view  text;                                    // the scanned file
+    std::string_view  prev;                                    // the previous token (empty before the first)
+    CodeTokenKind     prevKind = CodeTokenKind::Punctuation;
+    std::vector<char> brackets;                                // the open brackets: 's' = a subscript `[`, 'o' = any other
+
+    // A String token directly after `:`, `->` or `|` on the same line (`p: "X"`, `-> "X"`, `None | "X"`), or directly inside a
+    // subscript at its `[` or a `,` (`Name["X"]`, `Name[str, "X"]`): Python reads it as a type expression.
+    [[nodiscard]] bool isTypeExpression( std::string_view token ) const noexcept
+    {
+        const std::size_t prevEnd    = prev.empty() ? 0 : std::size_t( prev.data() + prev.size() - text.data() );
+        const std::size_t tokenStart = std::size_t( token.data() - text.data() );
+        const bool        sameLine   = !prev.empty() && text.find( '\n', prevEnd ) >= tokenStart;
+        const bool        annotation = sameLine && ( prev == ":" || prev == "->" || prev == "|" );
+        const bool        subscript  = !brackets.empty() && brackets.back() == 's' && ( prev == "[" || prev == "," );
+        return annotation || subscript;
+    }
+
+    // An `f`-prefixed string (`f"…"`, `rf'…'`, `F"""…"""`): the prefix is the Identifier token glued to the opening quote.
+    [[nodiscard]] bool isFormatString( std::string_view token ) const noexcept
+    {
+        if( prevKind != CodeTokenKind::Identifier || prev.size() > 2 || prev.data() + prev.size() != token.data() )
+        {
+            return false;
+        }
+        return prev.find_first_of( "fF" ) != std::string_view::npos && prev.find_first_not_of( "fFrR" ) == std::string_view::npos;
+    }
+
+    // Every token passes through once it is classified: a `[` after a name, a keyword (`type[`, PEP 585) or a `]` opens a
+    // subscript, `(` `{` and any other
+    // `[` open an ordinary bracket, a closer pops (an unbalanced closer is ignored), and the token becomes `prev`.
+    void advance( std::string_view token, CodeTokenKind kind )
+    {
+        if( kind == CodeTokenKind::Punctuation )
+        {
+            if( token == "(" || token == "{" )
+            {
+                brackets.push_back( 'o' );
+            }
+            else if( token == "[" )
+            {
+                brackets.push_back( ( prevKind == CodeTokenKind::Identifier || prevKind == CodeTokenKind::Keyword || prev == "]" ) ? 's' : 'o' );
+            }
+            else if( ( token == ")" || token == "]" || token == "}" ) && !brackets.empty() )
+            {
+                brackets.pop_back();
+            }
+        }
+        prev     = token;
+        prevKind = kind;
+    }
+};
+
+inline bool identifierTokenCountExceeds( const std::string& text, std::string_view name, std::size_t limit, Lang lang )
+{
+    std::size_t         tokens = 0;
+    StringTokenPosition at{ .text = text };
+    scanCodeTokens( text, 0, text.size(),
+                    CodeScanOptions{ .stripHashComments = usesHashLineComments( lang ), .munchMultiByteOperators = true,   // `->` is one token
+                                     .singleQuoteStrings = usesSingleQuoteStrings( lang ), .slashComments = lang != Lang::Python,
+                                     .tripleQuoteStrings = lang == Lang::Python },
+                    [ & ]( std::string_view token, CodeTokenKind kind )
+                    {
+                        if( kind == CodeTokenKind::Identifier || kind == CodeTokenKind::Keyword )
+                        {
+                            tokens += ( token == name ) ? 1u : 0u;
+                        }
+                        else if( kind == CodeTokenKind::String )
+                        {
+                            tokens += at.isTypeExpression( token ) ? identifierRunCount( token, name )
+                                    : at.isFormatString( token )   ? interpolatedRunCount( token, name ) : 0u;
+                        }
+                        at.advance( token, kind );
+                    } );
+    return tokens > limit;
+}
+
 struct BuiltinMethodGate
 {
     static constexpr std::uint32_t kNoClass  = 0xFFFFFFFFu;   // a top-level free definition
@@ -2215,11 +2524,16 @@ struct BuiltinMethodGate
     HashMap<std::string, std::uint32_t>            classId;       // every class-like definition NAME in the corpus → a dense id
     std::vector<std::string>                       className;     // dense id → name (ChaConeMemo::contains takes a std::string)
     std::vector<std::vector<std::uint32_t>>        fileClasses;   // fileId → the sorted class ids that file names (gated files only)
+    std::vector<std::vector<std::uint32_t>>        fileRefClasses;   // the same, minus the file's own class DEFINITIONS: a reference,
+                                                                     // binding or import names the class (sameFileReceiverEvidence)
     SymbolsByFile                                  containersByFile; // fileId → class-like and function-like symbol ids (ownerOf)
     mutable HashMap<NodeId, std::uint32_t>         ownerMemo;     // target → owning class id, kNoClass or kNested
     mutable HashMap<std::uint64_t, char>           namesMemo;     // (caller file << 32 | class id) → does the file name it (cone included)
+    mutable HashMap<std::uint64_t, char>           refNamesMemo;  // the same question over fileRefClasses
     mutable std::string                            key;           // reused "<fileId>#name" buffer
     bool                                           active = false;
+    mutable std::uint32_t                          textFileId = 0xFFFFFFFFu;   // namedBeyondDefinition's one-file byte cache
+    mutable std::optional<std::string>             text;
 
     static bool isClassLike( const Symbol& s ) noexcept
     {
@@ -2294,18 +2608,19 @@ struct BuiltinMethodGate
 
     // Does the caller's file name `owner` or a class in its inheritance cone? Memoised per (file, class), so a call site
     // costs one probe per target however many classes its file names.
-    bool fileNames( std::uint32_t fileId, std::uint32_t owner, ChaConeMemo& cones ) const
+    bool fileNames( std::uint32_t fileId, std::uint32_t owner, ChaConeMemo& cones, bool byReferenceOnly = false ) const
     {
         EXPECTS( owner < className.size(), "judge() handles kNoClass and kNested before asking" );
-        const auto [ memo, fresh ] = namesMemo.try_emplace( ( std::uint64_t( fileId ) << 32 ) | owner, char( 0 ) );
+        const std::vector<std::vector<std::uint32_t>>& lists = byReferenceOnly ? fileRefClasses : fileClasses;
+        const auto [ memo, fresh ] = ( byReferenceOnly ? refNamesMemo : namesMemo ).try_emplace( ( std::uint64_t( fileId ) << 32 ) | owner, char( 0 ) );
         if( !fresh )
         {
             return memo->second != 0;
         }
         bool names = false;
-        if( fileId < fileClasses.size() )
+        if( fileId < lists.size() )
         {
-            const std::vector<std::uint32_t>& named = fileClasses[ fileId ];
+            const std::vector<std::uint32_t>& named = lists[ fileId ];
             names = std::binary_search( named.begin(), named.end(), owner );
             if( !names && !named.empty() )
             {
@@ -2313,8 +2628,42 @@ struct BuiltinMethodGate
                 names = std::ranges::any_of( named, [ & ]( std::uint32_t k ) { return cones.contains( cone, className[ owner ], className[ k ] ); } );
             }
         }
+        if( !names && byReferenceOnly && fileId < fileClasses.size() )   // identifierTokenCountExceeds: why
+        {
+            const ChaConeMemo::Cone cone = cones.coneFor( className[ owner ] );
+            names = std::ranges::any_of( fileClasses[ fileId ], [ & ]( std::uint32_t k )
+            {
+                return ( k == owner || cones.contains( cone, className[ owner ], className[ k ] ) ) && namedBeyondDefinition( fileId, k );
+            } );
+        }
         memo->second = names ? 1 : 0;
         return names;
+    }
+
+    bool namedBeyondDefinition( std::uint32_t fileId, std::uint32_t k ) const   // unreadable: true (keep the edge)
+    {
+        if( textFileId != fileId )
+        {
+            textFileId = fileId;
+            text       = docparse::detail::readWholeFile( diskPath( ing, fileId ) );
+        }
+        if( !text || fileId >= containersByFile.size() )
+        {
+            return true;
+        }
+        // The class's own language decides the scan's comment and string shapes; a file with no definition of the class
+        // (k reached through the cone) takes its first container's, and an empty file scans as C-family (nothing to count).
+        std::size_t defs = 0;
+        Lang        lang = containersByFile[ fileId ].empty() ? Lang::Unknown : ing.symbols[ containersByFile[ fileId ].front() ].lang;
+        for( const NodeId t : containersByFile[ fileId ] )
+        {
+            if( isClassLike( ing.symbols[ t ] ) && ing.symbols[ t ].name == className[ k ] )
+            {
+                ++defs;
+                lang = ing.symbols[ t ].lang;
+            }
+        }
+        return identifierTokenCountExceeds( *text, className[ k ], defs, lang );
     }
 
     // Python: is the receiver of `x.m()` a MODULE whose file holds `target`? See the struct comment for the three shapes.
@@ -2370,7 +2719,16 @@ struct BuiltinMethodGate
         }
         if( owner != kNoClass )
         {
-            return fileNames( r.fileId, owner, cones ) ? Verdict::Admit : Verdict::NoEvidence;
+            // Python, a receiver other than self/cls: the class being DEFINED in the caller's file is no evidence that
+            // this receiver is an instance of it. registry.py defines ConnectionPool and calls `data.get( "repos" )` on
+            // a json dict and `entry.get( "alias" )` on a dict row; the file-grain rule bound all four such calls to
+            // ConnectionPool.get (4 of its 9 callers on the Python corpus the gate was measured on). Only a
+            // reference, binding or import naming the class — a construction, an annotation, an import — admits it
+            // there. Python records the receiver shape, so self./cls. calls (ThisObj, the NamedVar `cls`) inside the class keep the
+            // file-grain rule; JS/TS record none (floor 3) and Ruby's bare call IS a self call, so both keep it too.
+            const bool selfOrCls                = r.recv == RecvKind::ThisObj || ( r.recv == RecvKind::NamedVar && r.recvVar == "cls" );
+            const bool sameFileReceiverEvidence = r.lang == Lang::Python && !selfOrCls;
+            return fileNames( r.fileId, owner, cones, sameFileReceiverEvidence ) ? Verdict::Admit : Verdict::NoEvidence;
         }
         if( r.lang == Lang::Python )
         {
@@ -2406,25 +2764,51 @@ struct BuiltinMethodGate
 // collectFileClassEvidence: every class NAME each gated file mentions — the classes it defines, any class a reference
 // there names as callee, receiver or qualifier, or a binding names as type, variable or imported name — and every class
 // an ES import binding in that file resolves to (a default or renamed import names it under another spelling).
+// One class NAME a gated file mentions. A DEFINITION (the class-like symbol, or the bare declared name its statement
+// leaves) names it in fileClasses only; any other mention names it in fileRefClasses too — the list a Python call on a
+// receiver other than self/cls reads (BuiltinMethodGate::judge).
+inline void noteFileClass( BuiltinMethodGate& gate, const std::vector<char>& fileGated, std::uint32_t fileId, const std::string& name, bool definition )
+{
+    if( fileId >= fileGated.size() || fileGated[ fileId ] == 0 || name.empty() )
+    {
+        return;
+    }
+    const auto it = gate.classId.find( name );
+    if( it == gate.classId.end() )
+    {
+        return;
+    }
+    gate.fileClasses[ fileId ].push_back( it->second );
+    if( !definition )
+    {
+        gate.fileRefClasses[ fileId ].push_back( it->second );
+    }
+}
+
+// The class names one binding mentions: its type, its variable and its imported name. A bare declared NAME with no type
+// and no import is how Python records the `class Pool:` statement's own module-level name (a VarDecl) — the definition
+// again, not a use of the class — so that variable names it as a definition.
+inline void noteBindingClasses( BuiltinMethodGate& gate, const std::vector<char>& fileGated, const Binding& b )
+{
+    const bool bareDeclaration = b.kind == LocalBindKind::VarDecl && b.typeName.empty() && b.importedName.empty();
+    noteFileClass( gate, fileGated, b.fileId, b.typeName, false );
+    noteFileClass( gate, fileGated, b.fileId, b.var, bareDeclaration );
+    noteFileClass( gate, fileGated, b.fileId, b.importedName, false );
+}
+
 inline void collectFileClassEvidence( const IngestResult& ing, const std::vector<char>& fileGated, const JsImportTables& jsImports, BuiltinMethodGate& gate )
 {
     gate.fileClasses.assign( ing.files.size(), {} );
-    const auto note = [ & ]( std::uint32_t fileId, const std::string& name )
+    gate.fileRefClasses.assign( ing.files.size(), {} );
+    const auto note = [ & ]( std::uint32_t fileId, const std::string& name, bool definition = false )
     {
-        if( fileId >= fileGated.size() || fileGated[ fileId ] == 0 || name.empty() )
-        {
-            return;
-        }
-        if( const auto it = gate.classId.find( name ); it != gate.classId.end() )
-        {
-            gate.fileClasses[ fileId ].push_back( it->second );
-        }
+        noteFileClass( gate, fileGated, fileId, name, definition );
     };
     for( const Symbol& s : ing.symbols )
     {
         if( BuiltinMethodGate::isClassLike( s ) )
         {
-            note( s.fileId, s.name );   // defined here: every call in the file may be on an instance of it
+            note( s.fileId, s.name, /*definition=*/true );   // defined here: every call in the file may be on an instance of it
         }
     }
     for( const Reference& r : ing.references )
@@ -2438,9 +2822,7 @@ inline void collectFileClassEvidence( const IngestResult& ing, const std::vector
     }
     for( const Binding& b : ing.bindings )
     {
-        note( b.fileId, b.typeName );
-        note( b.fileId, b.var );
-        note( b.fileId, b.importedName );
+        noteBindingClasses( gate, fileGated, b );
     }
     for( const auto& [ importKey, bound ] : jsImports.targets )   // key "<fileId>#<local name>" (jsImportKey)
     {
@@ -2460,13 +2842,18 @@ inline void collectFileClassEvidence( const IngestResult& ing, const std::vector
         std::sort( named.begin(), named.end() );
         named.erase( std::unique( named.begin(), named.end() ), named.end() );
     }
+    for( std::vector<std::uint32_t>& named : gate.fileRefClasses )
+    {
+        std::sort( named.begin(), named.end() );
+        named.erase( std::unique( named.begin(), named.end() ), named.end() );
+    }
 }
 
 inline BuiltinMethodGate buildBuiltinMethodGate( const IngestResult& ing, const ExternalVeto& veto, const ExternalVetoTables& vetoTables,
                                                  const std::vector<std::vector<std::uint32_t>>& directIncludes, const JsImportTables& jsImports )
 {
     PROFILE_SCOPE_DESCRIBE( "buildGraph/2j: builtin-method name gate" );
-    BuiltinMethodGate gate{ ing, veto, vetoTables, directIncludes, jsImports, {}, {}, {}, {}, {}, {}, {}, false };
+    BuiltinMethodGate gate{ ing, veto, vetoTables, directIncludes, jsImports, {}, {}, {}, {}, {}, {}, {}, {}, {}, false };
     std::vector<char> fileGated( ing.files.size(), 0 );
     for( const Symbol& s : ing.symbols )
     {
@@ -2511,6 +2898,681 @@ struct DispositionTally
 // which narrowing stage committed it and to which canonical target. It adds rows to g.pinCensus and
 // changes NOTHING else — no candidate is admitted, dropped or reordered by it, so the emitted map is
 // byte-identical armed or not (test/pincensuscheck.sh arm (E) is the executable form of that sentence).
+
+// ── FE-A: FALSE-EDGE RULES (test/falseedgecheck.sh) ────────────────────────────────────────────────────────────────────────
+// The name ladder binds a call to the in-repo definitions of its SPELLING. Three call shapes have no in-repo target by
+// the language's own name-lookup rules and still got one — each a confident false row in a graded answer:
+//   (1) KIND. A call with no receiver reaches no method, accessor or field in a language without an implicit receiver
+//       (Go, Python, JS/TS, Rust: `append( xs, x )` never calls `func ( h *History ) append`), and a C call reaches no
+//       struct, union or enum (C has no constructor call: `opts_parse( … )` is the function, never `struct opts_parse`).
+//       Go adds PACKAGE scope: a bare call reaches its own package (directory) only — an unexported name always, an
+//       exported one unless the file dot-imports (a dot import brings exported names alone). The candidates the rule
+//       removes are dropped BEFORE the ladder, so when exactly one function is reachable it is the edge (Python's
+//       imported or star-imported `match`, C's `opts_parse`); when none is, the call is EXTERNAL only on proof the name is
+//       bound outside the tree (kindDecide: a Go predeclared, Python builtin or C library name, an outside import or
+//       `use`), and unresolved= otherwise (a parameter, a local, a closure: FalseEdgeRules::Verdict::Local).
+//   (2) GLOBALS. A JS/TS call on a global object (`JSON.parse`, `Buffer.from`, `crypto.subtle.verify`) or to a global
+//       function (`fetch( u )`), in a file that binds no name of that spelling (no import, require, declaration,
+//       parameter or local — ingest_jsimports.h records each), is a call into the runtime: EXTERNAL. Through an alias of
+//       the global object (`globalThis.fetch`) only when the called name is itself a global (a script's own top-level
+//       function is reachable as `window.f()`). Tables and provenance: externalnames.h. Python's builtins and C's
+//       library names keep the Phase-5 veto (ExternalVeto) — unchanged.
+//   (3) OUTSIDE PACKAGES. A JS/TS name bound by `require( 'pkg' )` (default or destructured) or `import * as ns from
+//       'pkg'`, or destructured from a global object (`const { stringify } = JSON`), and called bare or used as the
+//       receiver, is EXTERNAL when the specifier is foreign to the tree (jsModuleIsForeign — the ES named-import rule's
+//       own test). A Go `pkg.F()` through an import whose path no in-tree go.mod module contains is EXTERNAL; a tree
+//       with no go.mod above the caller proves nothing and keeps the ladder.
+// Never retargets a decided edge and never declines: a removed candidate is one the call cannot reach, an emptied set is
+// external= with proof (one `C external` census row) or unresolved= without, and every other call keeps the unchanged ladder.
+// CLASS-BODY KEEP. A function of the class whose BODY is the caller survives rule (1): Python evaluates a class body as a
+// scope, so `DEFAULTS = _default()` there reaches the `_default` defined above it.
+// STATED FLOORS (named in test/falseedgecheck.sh's header): implicit-receiver languages (Java, C#, C++, Kotlin, Swift,
+// Ruby, ObjC) are untouched — a bare call there reaches the enclosing class's methods; PHP, Lua and Zig have no arm; a
+// Go package whose name differs from its path's last element is not recognised as an import (its calls keep the
+// ladder); a JS `require` inside a function body and browser-only globals are not modelled; a JS script's top-level
+// function reached from another script by a bare global-table name would read as external.
+struct FalseEdgeRules
+{
+    enum class Verdict : std::uint8_t { Keep, Narrow, External, Local };   // Local: no reachable candidate and no proof the name is
+                                                                          //   outside the tree (a parameter, a local, a closure) — unresolved=
+
+    struct Alias
+    {
+        std::string source;           // module as written, or an identifier when fromIdentifier
+        bool        fromIdentifier = false;
+        bool        tombstone      = false;   // the name is bound twice in one file: decide nothing
+    };
+
+    const IngestResult&                         ing;
+    const HashMap<std::string, char>&           classNames;
+    const ExternalVeto&                         veto;         // hasLocal / importVerdict (Python, C): the Phase-5 evidence, reused
+    const ExternalVetoTables&                   vetoTables;   // importBindFile: the file a Python `from m import x` names
+    const std::vector<std::vector<std::uint32_t>>& directIncludes;   // caller file → the files it imports directly (a star import)
+    HashMap<std::string, Alias>                 alias;        // "<fileId>#name" → ModuleAlias (JS/TS and Go)
+    HashMap<std::string, char>                  bound;        // "<fileId>#name" → any import/alias binding of that name (JS/TS)
+    HashMap<std::string, std::vector<VarSpan>>  shadows;      // "<fileId>#name" → JsShadow spans
+    std::vector<char>                           goDotImport;  // fileId → the file has `import . "…"`
+    std::vector<std::string>                    goModules;    // every in-tree go.mod's module path
+    std::vector<char>                           goUnderModule;   // fileId → a go.mod sits at or above the file, inside the root
+    HashMap<std::string, char>                  jsVocabulary;    // jsModuleVocabulary, built only when a JS alias exists
+    HashMap<std::string, char>                  rustOutsideUse;  // "<fileId>#name": a Rust `use` of a path outside the crate names it
+    std::vector<std::vector<NodeId>>            functionsByFile; // fileId → its functions/methods sorted by sigStartByte (enclosingFunction)
+    mutable std::string                         key;
+    bool                                        active = false;
+
+    bool lookup( std::uint32_t fileId, std::string_view name, const HashMap<std::string, char>& set ) const
+    {
+        return set.contains( fileNameKey( key, fileId, name ) );
+    }
+    const Alias* aliasOf( std::uint32_t fileId, std::string_view name ) const
+    {
+        const auto it = alias.find( fileNameKey( key, fileId, name ) );
+        return ( it == alias.end() || it->second.tombstone ) ? nullptr : &it->second;
+    }
+    bool shadowedAt( const Reference& r, std::string_view name ) const
+    {
+        const auto it = shadows.find( fileNameKey( key, r.fileId, name ) );
+        return it != shadows.end()
+            && std::any_of( it->second.begin(), it->second.end(), [ & ]( const VarSpan& s ) { return r.startByte >= s.startByte && r.startByte < s.endByte; } );
+    }
+    // the file binds `name` at this site: an import or alias of it, or a declaration whose scope holds the site
+    bool jsFileBinds( const Reference& r, std::string_view name ) const
+    {
+        if( lookup( r.fileId, name, bound ) )
+        {
+            return true;
+        }
+        return shadowedAt( r, name );
+    }
+    bool goPathOutsideTree( std::string_view path ) const
+    {
+        return std::none_of( goModules.begin(), goModules.end(), [ & ]( const std::string& m ) { return pathIsUnder( path, m ); } );
+    }
+
+    // A candidate the call can only reach through an instance: a method, accessor or field — for Python, a function
+    // whose scope names a class (Python records methods as functions). A FUNCTION-LOCAL def (Symbol::fnLocal: a `def`
+    // nested in a method, whose recorded scope is still the class) is no member: the ladder's own reach rule judges it.
+    bool memberLike( const Symbol& s ) const
+    {
+        if( s.fnLocal != 0 )
+        {
+            return false;
+        }
+        return s.kind == SymKind::Method || s.kind == SymKind::Field
+            || ( s.lang == Lang::Python && s.kind == SymKind::Function && !s.scope.empty() && classNames.find( s.scope ) != classNames.end() );
+    }
+    // CLASS-BODY KEEP: a call in a class BODY (the caller is the class itself — Python's `DEFAULTS = _default()`) reaches
+    // the functions defined earlier in that body. A METHOD's bare call does not reach its siblings (that needs `self.`).
+    bool callerOwnClass( const Symbol& caller, const Symbol& cand ) const
+    {
+        const bool callerIsClass = caller.kind == SymKind::Class || caller.kind == SymKind::Struct || caller.kind == SymKind::Interface;
+        return callerIsClass && !cand.scope.empty() && cand.scope == caller.name;
+    }
+    bool cannotReach( const Reference& r, const Symbol& caller, const Symbol& cand, std::string_view callerDir ) const
+    {
+        if( r.lang == Lang::C )
+        {
+            return cand.kind == SymKind::Class || cand.kind == SymKind::Struct || cand.kind == SymKind::Interface;
+        }
+        if( memberLike( cand ) && !callerOwnClass( caller, cand ) )
+        {
+            return true;
+        }
+        if( r.lang == Lang::Go )
+        {
+            const bool exported = !r.calleeName.empty() && r.calleeName[ 0 ] >= 'A' && r.calleeName[ 0 ] <= 'Z';
+            const bool dot      = r.fileId < goDotImport.size() && goDotImport[ r.fileId ] != 0;
+            return !( exported && dot ) && includerDir( rootRelPath( ing, cand.fileId ) ) != callerDir;
+        }
+        return false;
+    }
+
+    // Rule (1): split the candidates into what a receiverless call cannot reach (`dropped`) and the rest. `kept` receives the
+    // rest (other languages included: the ladder's own language filter still runs); the count is of the call's language.
+    struct Split
+    {
+        bool        dropped        = false;
+        std::size_t compatibleKept = 0;
+    };
+    Split splitReachable( const Reference& r, std::span<const NodeId> ids, rw::SmallVec<NodeId, 2>& kept ) const
+    {
+        const Symbol&          caller    = ing.symbols[ r.fromSymbol ];
+        const std::string_view callerDir = includerDir( rootRelPath( ing, r.fileId ) );
+        Split out;
+        for( NodeId c : ids )
+        {
+            const Symbol& s = ing.symbols[ c ];
+            const bool compatible = langCompatible( s.lang, r.lang );
+            if( compatible && cannotReach( r, caller, s, callerDir ) )
+            {
+                out.dropped = true;
+                continue;
+            }
+            kept.push_back( c );
+            out.compatibleKept += compatible ? 1u : 0u;
+        }
+        ENSURES( kept.size() <= ids.size() && out.compatibleKept <= kept.size(), "the kind rule only removes candidates" );
+        return out;
+    }
+    // keep only the members of `kept` (of the call's language) for which `pred` holds; others of other languages stay
+    template <class Pred>
+    std::size_t keepOnly( const Reference& r, rw::SmallVec<NodeId, 2>& kept, Pred&& pred ) const
+    {
+        std::size_t n = 0, compatible = 0;
+        for( NodeId c : kept )
+        {
+            const bool lang = langCompatible( ing.symbols[ c ].lang, r.lang );
+            if( !lang || pred( ing.symbols[ c ] ) )
+            {
+                kept[ n++ ] = c;
+                compatible += lang ? 1u : 0u;
+            }
+        }
+        ENSURES( compatible <= n, "a kept candidate of the call's language is a kept candidate" );
+        kept.resize( n );
+        return compatible;
+    }
+    // A local or parameter of the caller — or of a function ENCLOSING it, which a nested def/closure captures (textual:
+    // `get_label_width = self.get_label_width` in a method, called from a `def` nested in it). The enclosing chain is read
+    // by span: the innermost function or method of the same file whose span holds the current one, at most 8 levels.
+    bool isLocalOfCaller( const Reference& r ) const
+    {
+        if( veto.hasLocal( r, r.calleeName ) )
+        {
+            return true;
+        }
+        NodeId cur = r.fromSymbol;
+        for( int depth = 0; depth < 8; ++depth )
+        {
+            cur = enclosingFunction( cur );
+            if( cur == kNoNode )
+            {
+                return false;
+            }
+            if( veto.localNameSet.contains( fileNameKey( key, cur, r.calleeName ) ) )
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    // the innermost function/method of the same file whose span strictly holds `id`'s span; kNoNode when none
+    NodeId enclosingFunction( NodeId id ) const
+    {
+        const Symbol& inner = ing.symbols[ id ];
+        if( inner.fileId >= functionsByFile.size() )
+        {
+            return kNoNode;
+        }
+        NodeId best = kNoNode;
+        for( NodeId c : functionsByFile[ inner.fileId ] )
+        {
+            const Symbol& s = ing.symbols[ c ];
+            if( s.sigStartByte > inner.sigStartByte )
+            {
+                break;   // sorted by start: nothing later can hold it
+            }
+            const bool holds = c != id && s.endByte >= inner.endByte && ( s.sigStartByte < inner.sigStartByte || s.endByte > inner.endByte );
+            if( holds )
+            {
+                best = c;   // later starts are more inner
+            }
+        }
+        return best;
+    }
+
+    // Rule (1) for a receiverless call, per language. Nothing dropped → Keep: the ladder decides exactly as before. What
+    // is left when something was dropped is narrowed by the language's own visibility where the extractor records it;
+    // an emptied set is External only where the name is provably bound outside the tree, else Local/Unresolved.
+    Verdict kindDecide( const Reference& r, std::span<const NodeId> ids, rw::SmallVec<NodeId, 2>& kept ) const
+    {
+        if( isLocalOfCaller( r ) )
+        {
+            // a call through a parameter or local (`write = self.write; write( b )`, `fn( x )`): which definition it holds
+            // is a receiver question this rule cannot answer — the ladder keeps it exactly as before (FE-B's territory)
+            return Verdict::Keep;
+        }
+        const Split split = splitReachable( r, ids, kept );
+        if( !split.dropped )
+        {
+            kept.clear();
+            return Verdict::Keep;
+        }
+        if( r.lang == Lang::Python )
+        {
+            return pythonVisible( r, kept );
+        }
+        if( ( r.lang == Lang::JavaScript || r.lang == Lang::TypeScript ) && split.compatibleKept != 0 )
+        {
+            // a module's bare name is its own declaration or an import (imports never reach here: decide() keeps them),
+            // or an ambient `declare` in a .d.ts: another file's ordinary function is out of reach
+            const std::size_t visible = keepOnly( r, kept, [ & ]( const Symbol& s )
+            {
+                return ( s.fileId == r.fileId && !localDefOutOfReach( ing, s.id, r ) ) || rootRelPath( ing, s.fileId ).ends_with( ".d.ts" );
+            } );
+            if( visible != 0 )
+            {
+                return Verdict::Narrow;
+            }
+            return Verdict::Local;
+        }
+        if( split.compatibleKept != 0 )
+        {
+            return Verdict::Narrow;
+        }
+        switch( r.lang )
+        {
+            case Lang::Go:
+            {
+                // only a predeclared function is provably outside the tree; anything else is a local closure or a miss
+                const bool predeclared = std::ranges::binary_search( externalnames::kGoBuiltinNames, std::string_view( r.calleeName ), rw::sortutil::svLess );
+                return predeclared ? Verdict::External : Verdict::Local;
+            }
+            case Lang::JavaScript: case Lang::TypeScript:
+            {
+                return Verdict::Local;   // JS/TS locals and parameters are not recorded here: decline, never claim external
+            }
+            case Lang::Rust:
+            {
+                // a `use` of an outside path naming it (`use termkit::render;`) proves it; a closure or local does not
+                return lookup( r.fileId, r.calleeName, rustOutsideUse ) ? Verdict::External : Verdict::Local;
+            }
+            default:
+            {
+                // C: a C library name (the Phase-5 table) is provably outside; any other name whose only in-repo spellings are
+                // types has no in-repo function and no proof of an outside one — unresolved=
+                return externalnames::isCFamilyStdName( r.calleeName ) ? Verdict::External : Verdict::Local;
+            }
+        }
+    }
+    // Python visibility for a receiverless call that lost a method candidate (a parameter or local never gets here): an
+    // imported name keeps the ladder unless the module it is imported FROM defines a reachable candidate (then exactly
+    // those); otherwise the same file's and the imported files' (a star import) definitions, and External when there are
+    // none (a builtin, an outside import, or a star import of an outside module).
+    Verdict pythonVisible( const Reference& r, rw::SmallVec<NodeId, 2>& kept ) const
+    {
+        const char verdict = veto.importVerdict( r, r.calleeName );
+        if( verdict == 'i' || verdict == 'u' )
+        {
+            const auto mf = vetoTables.memberImportFile.find( fileNameKey( key, r.fileId, r.calleeName ) );
+            if( mf == vetoTables.memberImportFile.end() || mf->second == kNoFile )
+            {
+                kept.clear();
+                return Verdict::Keep;
+            }
+            // the module itself, or one re-export hop (`from .base import reverse` in a package __init__)
+            const std::uint32_t                    module   = mf->second;
+            const std::vector<std::uint32_t>* const reexport = module < directIncludes.size() ? &directIncludes[ module ] : nullptr;
+            const auto fromModule = [ & ]( const Symbol& s )
+            {
+                return s.fileId == module || ( reexport != nullptr && std::find( reexport->begin(), reexport->end(), s.fileId ) != reexport->end() );
+            };
+            if( keepOnly( r, kept, fromModule ) == 0 )
+            {
+                kept.clear();
+                return Verdict::Keep;   // `register = registry.register` re-exported: the imported object may BE a method
+            }
+            return Verdict::Narrow;
+        }
+        const std::vector<std::uint32_t>* direct  = r.fileId < directIncludes.size() ? &directIncludes[ r.fileId ] : nullptr;
+        const std::vector<std::uint32_t>* imports = r.fileId < vetoTables.importFiles.size() ? &vetoTables.importFiles[ r.fileId ] : nullptr;
+        const auto in = []( const std::vector<std::uint32_t>* files, std::uint32_t f ) { return files != nullptr && std::find( files->begin(), files->end(), f ) != files->end(); };
+        const std::size_t visible = keepOnly( r, kept, [ & ]( const Symbol& s )
+        {
+            if( localDefOutOfReach( ing, s.id, r ) )
+            {
+                return false;   // another function's nested def: same file, still out of this call's reach
+            }
+            return s.fileId == r.fileId || in( direct, s.fileId ) || in( imports, s.fileId ) || callerOwnClass( ing.symbols[ r.fromSymbol ], s );
+        } );
+        if( visible != 0 && verdict != 'x' )
+        {
+            return Verdict::Narrow;
+        }
+        // provably outside only for a builtin or an outside import; any other name (a closure variable of an enclosing
+        // function, a star import of an unresolved module) has no in-repo target here but is not claimed external
+        return ( verdict == 'x' || externalnames::isPythonBuiltin( r.calleeName ) ) ? Verdict::External : Verdict::Local;
+    }
+
+    // JS/TS: `name` (a bare callee, or a member call's receiver root) bound in this file by an alias — Keep or External by
+    // the alias's source; nullopt when no alias binds it at this site
+    std::optional<Verdict> jsAliasVerdict( const Reference& r, std::string_view name ) const
+    {
+        if( shadowedAt( r, name ) )
+        {
+            return Verdict::Keep;
+        }
+        if( const Alias* a = aliasOf( r.fileId, name ) )
+        {
+            return aliasIsForeign( *a, r ) ? Verdict::External : Verdict::Keep;
+        }
+        return std::nullopt;
+    }
+    // JS/TS member call: through an outside alias, a global object, or the global object itself on a global name
+    Verdict jsMemberDecide( const Reference& r ) const
+    {
+        const std::string_view root = r.memberRoot;
+        if( root.empty() || root == "this" )
+        {
+            return Verdict::Keep;
+        }
+        if( const std::optional<Verdict> v = jsAliasVerdict( r, root ) )
+        {
+            return *v;
+        }
+        if( lookup( r.fileId, root, bound ) )
+        {
+            return Verdict::Keep;
+        }
+        const externalnames::JsGlobal kind = externalnames::jsGlobalKindOf( root );
+        const bool viaGlobal = kind == externalnames::JsGlobal::Object
+                            || ( kind == externalnames::JsGlobal::GlobalObject && externalnames::isJsGlobalName( r.calleeName ) );
+        return viaGlobal ? Verdict::External : Verdict::Keep;
+    }
+    // JS/TS bare call: through an outside alias, or to a global no binding of the file hides
+    Verdict jsBareDecide( const Reference& r ) const
+    {
+        if( const std::optional<Verdict> v = jsAliasVerdict( r, r.calleeName ) )
+        {
+            return *v;
+        }
+        return ( !lookup( r.fileId, r.calleeName, bound ) && externalnames::isJsGlobalName( r.calleeName ) ) ? Verdict::External : Verdict::Keep;
+    }
+    bool aliasIsForeign( const Alias& a, const Reference& r ) const
+    {
+        if( a.fromIdentifier )   // `const { x } = G`: foreign iff G is a global object no binding in the file hides
+        {
+            return externalnames::jsGlobalKindOf( a.source ) == externalnames::JsGlobal::Object && !jsFileBinds( r, a.source );
+        }
+        return jsModuleIsForeign( a.source, jsVocabulary );
+    }
+
+    // The one entry point. `ids` is the name's whole candidate list; `kept` (cleared here) receives the narrowed list on Narrow.
+    Verdict decide( const Reference& r, std::span<const NodeId> ids, rw::SmallVec<NodeId, 2>& kept ) const
+    {
+        kept.clear();
+        if( !active || r.role != RefRole::Call || !r.qualifier.empty() || r.fromSymbol >= ing.symbols.size() || r.recv != RecvKind::None )
+        {
+            return Verdict::Keep;
+        }
+        switch( r.lang )
+        {
+            case Lang::JavaScript: case Lang::TypeScript:
+            {
+                const Verdict v = r.memberCall ? jsMemberDecide( r ) : jsBareDecide( r );
+                if( v != Verdict::Keep || r.memberCall || lookup( r.fileId, r.calleeName, bound ) )
+                {
+                    return v;   // an imported or required name keeps its ladder: it may name an object's method
+                }
+                return kindDecide( r, ids, kept );
+            }
+            case Lang::Go:
+            {
+                if( r.memberCall )
+                {
+                    const Alias* a = aliasOf( r.fileId, r.memberRoot );
+                    const bool known = r.fileId < goUnderModule.size() && goUnderModule[ r.fileId ] != 0;
+                    return ( a != nullptr && known && goPathOutsideTree( a->source ) ) ? Verdict::External : Verdict::Keep;
+                }
+                return kindDecide( r, ids, kept );
+            }
+            case Lang::Rust:
+            {
+                return r.memberCall ? Verdict::Keep : kindDecide( r, ids, kept );
+            }
+            case Lang::C:
+            {
+                // `ops->open( x )` is a call through a function-pointer field: no struct answers it either, but what does
+                // is in the tree or not — unknown, so an emptied set is unresolved=, never external=
+                const Verdict v = kindDecide( r, ids, kept );
+                return ( r.memberCall && v == Verdict::External ) ? Verdict::Local : v;
+            }
+            case Lang::Python:
+            {
+                return kindDecide( r, ids, kept );
+            }
+            default:
+            {
+                return Verdict::Keep;
+            }
+        }
+    }
+};
+
+// The module path a go.mod declares (`module example.com/x`), or "" when the file has no module line.
+inline std::string goModulePathOf( std::string_view text )
+{
+    std::size_t at = 0;
+    while( at < text.size() )
+    {
+        std::size_t end = text.find( '\n', at );
+        if( end == std::string_view::npos ) { end = text.size(); }
+        std::string_view line = text.substr( at, end - at );
+        at = end + 1;
+        while( !line.empty() && ( line.front() == ' ' || line.front() == '\t' ) ) { line.remove_prefix( 1 ); }
+        if( !line.starts_with( "module" ) || line.size() < 7 || ( line[ 6 ] != ' ' && line[ 6 ] != '\t' ) ) { continue; }
+        line.remove_prefix( 7 );
+        line = line.substr( 0, line.find( "//" ) );   // the comment goes FIRST: `module x // c` and `module "x" // c` are x
+        while( !line.empty() && ( line.front() == ' ' || line.front() == '\t' ) ) { line.remove_prefix( 1 ); }
+        while( !line.empty() && ( line.back() == ' ' || line.back() == '\t' || line.back() == '\r' ) ) { line.remove_suffix( 1 ); }
+        if( line.size() >= 2 && line.front() == '"' && line.back() == '"' ) { line = line.substr( 1, line.size() - 2 ); }
+        return std::string( line );
+    }
+    return {};
+}
+
+// The module paths a go.mod puts in the tree: its `module` line, and every `replace X => ./local` (or ../, /) left side —
+// a module replaced by a LOCAL directory is this tree's code under another path (a multi-root workspace's sibling root).
+inline std::vector<std::string> goModuleTreePaths( std::string_view text )
+{
+    std::vector<std::string> paths;
+    if( std::string m = goModulePathOf( text ); !m.empty() )
+    {
+        paths.push_back( std::move( m ) );
+    }
+    for( std::size_t at = 0; at < text.size(); )
+    {
+        std::size_t end = text.find( '\n', at );
+        end = end == std::string_view::npos ? text.size() : end;
+        std::string_view line = text.substr( at, end - at );
+        line = trimWs( line.substr( 0, line.find( "//" ) ) );   // a comment is no directive: `// a => ./b` names nothing
+        at = end + 1;
+        if( line.starts_with( "replace" ) )
+        {
+            line = trimWs( line.substr( 7 ) );
+        }
+        const std::size_t arrow = line.find( "=>" );
+        if( arrow == std::string_view::npos || line.starts_with( "(" ) )
+        {
+            continue;
+        }
+        const std::string_view left   = trimWs( line.substr( 0, arrow ) );
+        const std::string_view target = trimWs( line.substr( arrow + 2 ) );
+        if( !left.empty() && !target.empty() && ( target.front() == '.' || target.front() == '/' ) )
+        {
+            paths.emplace_back( left.substr( 0, left.find_first_of( " \t" ) ) );   // drop a version: `X v1.2.3 => ./x`
+        }
+    }
+    return paths;
+}
+
+// FE-A's Go module census: for every Go file, the go.mod at or above its directory INSIDE the root (read once per
+// directory); every module path found joins goModules. A file with none above it is unknown (goUnderModule 0).
+inline void collectGoModules( const IngestResult& ing, FalseEdgeRules& rules )
+{
+    rules.goUnderModule.assign( ing.files.size(), 0 );
+    HashMap<std::string, std::vector<std::string>> modOfDir;   // disk directory → its go.mod's tree paths (empty: no go.mod)
+    HashMap<std::string, char>        seenModule;
+    for( const Symbol& s : ing.symbols )
+    {
+        if( s.lang != Lang::Go || s.fileId >= ing.files.size() || rules.goUnderModule[ s.fileId ] != 0 )
+        {
+            continue;
+        }
+        std::string_view rel  = rootRelPath( ing, s.fileId );
+        std::string      disk = diskPath( ing, s.fileId );
+        // walk up as many directories as the root-relative path has, never above the root
+        while( true )
+        {
+            const std::size_t relCut  = rel.rfind( '/' );
+            const std::size_t diskCut = disk.rfind( '/' );
+            if( diskCut == std::string::npos )
+            {
+                break;
+            }
+            disk.resize( diskCut );
+            auto [ it, fresh ] = modOfDir.try_emplace( disk, std::vector<std::string>{} );
+            if( fresh )
+            {
+                if( const std::optional<std::string> text = docparse::detail::readWholeFile( disk + "/go.mod" ) )
+                {
+                    it->second = goModuleTreePaths( *text );
+                }
+            }
+            if( !it->second.empty() )
+            {
+                rules.goUnderModule[ s.fileId ] = 1;
+                for( const std::string& m : it->second )
+                {
+                    if( seenModule.try_emplace( m, '\0' ).second )
+                    {
+                        rules.goModules.push_back( m );
+                    }
+                }
+                break;
+            }
+            if( relCut == std::string_view::npos )
+            {
+                break;   // the root itself was the last directory read
+            }
+            rel = rel.substr( 0, relCut );
+        }
+    }
+    std::sort( rules.goModules.begin(), rules.goModules.end() );   // determinism: discovery order follows symbol order
+}
+
+// FE-A: the binding facts — every ModuleAlias (Go dot imports apart), every name a JS/TS import or alias binds, and every
+// JsShadow span. Returns whether any alias exists (only then is the JS module vocabulary worth building).
+inline bool collectFalseEdgeBindings( const IngestResult& ing, FalseEdgeRules& rules )
+{
+    bool anyAlias = false;
+    for( const Binding& b : ing.bindings )
+    {
+        if( b.fileId >= ing.files.size() || b.var.empty() )
+        {
+            continue;
+        }
+        if( b.kind == LocalBindKind::ModuleAlias && b.var == "." )
+        {
+            rules.goDotImport[ b.fileId ] = 1;
+        }
+        else if( b.kind == LocalBindKind::ModuleAlias )
+        {
+            const std::string k = jsImportKey( b.fileId, b.var );
+            auto [ it, fresh ] = rules.alias.try_emplace( k, FalseEdgeRules::Alias{ b.typeName, b.isFromAssignment, false } );
+            if( !fresh && ( it->second.source != b.typeName || it->second.fromIdentifier != b.isFromAssignment ) )
+            {
+                it->second.tombstone = true;   // one name, two different bindings: decide nothing
+            }
+            rules.bound.try_emplace( k, '\0' );
+            anyAlias = true;
+        }
+        else if( b.kind == LocalBindKind::JsImport )
+        {
+            rules.bound.try_emplace( jsImportKey( b.fileId, b.var ), '\0' );
+        }
+        else if( b.kind == LocalBindKind::JsShadow )
+        {
+            rules.shadows[ jsImportKey( b.fileId, b.var ) ].push_back( { b.spanStart, b.spanEnd } );
+        }
+    }
+    return anyAlias;
+}
+
+// FE-A Rust: the modules of this tree — every .rs file stem and every directory name a .rs path passes through.
+inline HashMap<std::string, char> rustModuleNames( const IngestResult& ing )
+{
+    HashMap<std::string, char> names;
+    for( std::uint32_t f = 0; f < ing.files.size(); ++f )
+    {
+        std::string_view path = rootRelPath( ing, f );
+        if( !path.ends_with( ".rs" ) )
+        {
+            continue;
+        }
+        path.remove_suffix( 3 );
+        for( std::size_t at = 0; at <= path.size(); )
+        {
+            const std::size_t slash = std::min( path.find( '/', at ), path.size() );
+            if( slash > at )
+            {
+                names.try_emplace( std::string( path.substr( at, slash - at ) ), '\0' );
+            }
+            at = slash + 1;
+        }
+    }
+    return names;
+}
+
+// FE-A Rust: `use a::b::c;` whose first segment is not crate/self/super/a module of this tree names an outside item `c`.
+inline void collectRustOutsideUses( const IngestResult& ing, FalseEdgeRules& rules )
+{
+    const HashMap<std::string, char> modules = rustModuleNames( ing );
+    if( modules.empty() )
+    {
+        return;   // no Rust in the tree
+    }
+    for( const Include& inc : ing.includes )
+    {
+        const std::string_view path = inc.target;
+        if( inc.fileId >= ing.files.size() || path.starts_with( "mod:" ) || !rootRelPath( ing, inc.fileId ).ends_with( ".rs" ) )
+        {
+            continue;
+        }
+        const std::size_t first = path.find( "::" );
+        if( first == std::string_view::npos || path.find( '{' ) != std::string_view::npos )
+        {
+            continue;   // `use x;` (a crate root) or a brace group: no single named item
+        }
+        const std::string_view head = path.substr( 0, first );
+        if( head != "crate" && head != "self" && head != "super" && !modules.contains( std::string( head ) ) )
+        {
+            rules.rustOutsideUse.try_emplace( jsImportKey( inc.fileId, path.substr( path.rfind( "::" ) + 2 ) ), '\0' );
+        }
+    }
+}
+
+inline FalseEdgeRules buildFalseEdgeRules( const IngestResult& ing, const HashMap<std::string, char>& classNames, const ExternalVeto& veto,
+                                           const ExternalVetoTables& vetoTables, const std::vector<std::vector<std::uint32_t>>& directIncludes )
+{
+    PROFILE_SCOPE_DESCRIBE( "buildGraph/2h: FE-A false-edge rules" );
+    FalseEdgeRules rules{ ing, classNames, veto, vetoTables, directIncludes };
+    rules.goDotImport.assign( ing.files.size(), 0 );
+    if( collectFalseEdgeBindings( ing, rules ) )
+    {
+        rules.jsVocabulary = jsModuleVocabulary( ing );
+    }
+    collectRustOutsideUses( ing, rules );
+    rules.functionsByFile.assign( ing.files.size(), {} );
+    for( const Symbol& s : ing.symbols )
+    {
+        if( ( s.kind == SymKind::Function || s.kind == SymKind::Method ) && s.fileId < ing.files.size() )
+        {
+            rules.functionsByFile[ s.fileId ].push_back( s.id );
+        }
+    }
+    for( std::vector<NodeId>& list : rules.functionsByFile )
+    {
+        std::ranges::sort( list, [ & ]( NodeId a, NodeId b ) { return ing.symbols[ a ].sigStartByte < ing.symbols[ b ].sigStartByte
+                                                                      || ( ing.symbols[ a ].sigStartByte == ing.symbols[ b ].sigStartByte && a < b ); } );
+    }
+    if( std::ranges::any_of( ing.symbols, []( const Symbol& s ) { return s.lang == Lang::Go; } ) )
+    {
+        collectGoModules( ing, rules );
+    }
+    rules.active = true;
+    return rules;
+}
 
 inline void internDeclinedList( Graph& g, HashMap<std::uint64_t, rw::SmallVec<std::uint32_t, 1>>& listsByHash, std::span<const NodeId> cand );   // defined beside declinedCallsNaming, its one reader
 inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = nullptr, bool census = false )
@@ -2832,6 +3894,8 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
     // method of the caller language's builtin map/list/set/string type. Inert (active=false) on a corpus with no
     // symbol in a gated language.
     const BuiltinMethodGate builtinGate = buildBuiltinMethodGate( ing, externalVeto, extVeto, includeAdj, jsImports );
+    const FalseEdgeRules    falseEdges  = buildFalseEdgeRules( ing, classNames, externalVeto, extVeto, includeAdj );   // FE-A (test/falseedgecheck.sh)
+    rw::SmallVec<NodeId, 2> feKept;                                                                        // its narrowed candidates, reused
     std::vector<NodeId>     gateRefused;   // reused: a gated call's targets refused for want of evidence (the list a decline records)
     const auto vetoExternal = [ & ]( const Reference& ref ) -> CallDisposition
     {
@@ -2897,6 +3961,11 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
     // for `class C(A, B)` Python's MRO puts A's chain before B's, so when both A and B define `m`, `super().m()`
     // in C names A::m. chaUp is sorted for its membership uses and cannot say which base came first.
     HashMap<std::string, std::vector<std::string>> chaUpDeclared;
+    // Ruby bases, SCOPED by Ruby's own constant lookup (resolve.h::RubyBaseScope; test/rubyinheritcheck.sh floor
+    // (c)). Read here — a base the tree never opens (`< ActiveRecord::Base`) adds no CHA edge, so its class's walk
+    // cannot reach an unrelated in-tree `Base` — and by the implementor pass below. Empty on a Ruby-free corpus.
+    const RubyBaseScope rubyBases = buildRubyBaseScope( ing );
+    g.rubyBasesUnscoped = rubyBases.disclosure.unscoped;   // ruby_bases_unscoped= (absent at zero)
     {
         const auto isClassLikeK = []( SymKind k ) noexcept
         { return k == SymKind::Class || k == SymKind::Struct || k == SymKind::Interface; };
@@ -2906,6 +3975,10 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
             if( !ir.isInherit )
             {
                 continue;
+            }
+            if( const std::string* scoped = rubyBases.resolvedBase( std::size_t( &ir - ing.references.data() ) ); scoped && scoped->empty() )
+            {
+                continue;   // a Ruby base the tree never opens: nothing in-tree to walk to
             }
             std::string_view derivedName;
             if( !ir.qualifier.empty() )
@@ -2936,6 +4009,7 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
     ChaConeMemo              chaCones( chaUp, chaDown );   // one cone per receiver type, computed on first use (see the type)
     const ClassIdentity      classIds = buildClassIdentity( ing, chaUp );   // Rule 2's class identity: nesting, owners, real inheritance (resolve.h)
     std::vector<NodeId>      filtScratch;  // reused per-call survivor buffer for CHA-lite / arity filtering
+    rw::SmallVec<NodeId, 2>  reachScratch; // reused per-call buffer: the candidates a call can reach by name (reachableByName)
 
     // ---- census arming + the ORACLE side (eval-only; src/pincensus.h) ------------------------------
     // The oracle rows are a straight transcription of the overlay's own (from, calleeName) → target table
@@ -3409,10 +4483,36 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
         // The builtin-method name gate (BuiltinMethodGate): a call whose name is a builtin type's method and that nothing
         // above resolved is FLAGGED here, before Rule 3 (whose transitive-import evidence says nothing about a receiver),
         // and filtered after the whole ladder has decided — see the post-filter just before the edge is committed.
+        // FE-A (FalseEdgeRules above): a candidate the language's own name lookup cannot reach leaves the list here, before
+        // Rule 3 and the ladder pick from it; a call left with none — or bound to a global or an outside package — is external=.
+        const rw::SmallVec<NodeId, 2>* baseIds = it != byName.end() ? &it->second : nullptr;
+        if( !scipPinned && !canonical && !narrowed && baseIds != nullptr && bindingTier.empty() )
+        {
+            switch( falseEdges.decide( r, *baseIds, feKept ) )
+            {
+                case FalseEdgeRules::Verdict::External: disposition = vetoExternal( r ); continue;
+                case FalseEdgeRules::Verdict::Local:    ++g.unresolvedOut[ r.fromSymbol ]; disposition = CallDisposition::Unresolved; continue;
+                case FalseEdgeRules::Verdict::Narrow:
+                    ASSUME( !feKept.empty(), "Narrow is returned only while a candidate of the call's language survives" );
+                    baseIds = &feKept;
+                    break;
+                case FalseEdgeRules::Verdict::Keep:     break;
+            }
+        }
         const bool builtinGated = !scipPinned && !canonical && !narrowed && it != byName.end() && builtinGate.appliesTo( r );
+        // A function-local def out of this call's reach YIELDS (reachableByName, above): `nameIds` is the set the call
+        // can name, and the whole list is consulted only when that set does not decide. Not on a call the builtin-method
+        // gate flagged or the external-name veto below refuses (`d.get()`, `re.sub()`): their answer is "outside the tree"
+        // whichever same-named def competes, and yielding would move them from external= into declined=, so such a call
+        // resolves exactly as it did before local defs had bodies.
+        const bool localsYield = !scipPinned && !canonical && !narrowed && !builtinGated && it != byName.end() && !ing.fnLocalScopes.empty()
+                                 && reachableByName( ing, *baseIds, r, reachScratch )
+                                 && !( r.role == RefRole::Call && r.qualifier.empty() && bindingTier.empty() && externalVeto.isExternalBound( r ) );
+        const rw::SmallVec<NodeId, 2>* nameIds = localsYield ? &reachScratch : baseIds;
         if( !scipPinned && !canonical && !narrowed && it != byName.end() )
         {
-            if( narrower.rule3IncludeFile( it->second, r.fileId, rule3Out ) )
+            if( narrower.rule3IncludeFile( *nameIds, r.fileId, rule3Out, localsYield ? 1u : 2u )
+                || ( localsYield && narrower.rule3IncludeFile( *baseIds, r.fileId, rule3Out ) ) )
             {
                 for( NodeId c : rule3Out )
                 {
@@ -3452,11 +4552,19 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
             }
             else
             {
-                for( NodeId c : it->second )
+                for( NodeId c : *nameIds )
                 {
                     if( langCompatible( ing.symbols[c].lang, r.lang ) && sameRoot( c, r.fileId ) )
                     {
                         cand.push_back( c ); // same lang, or ObjC↔C++ bridge; same ROOT (A10)
+                    }
+                }
+                for( std::size_t i = 0; localsYield && cand.empty() && i < baseIds->size(); ++i )   // nothing reachable survived: the whole list
+                {
+                    const NodeId c = ( *baseIds )[ i ];
+                    if( langCompatible( ing.symbols[c].lang, r.lang ) && sameRoot( c, r.fileId ) )
+                    {
+                        cand.push_back( c );
                     }
                 }
                 // §3.1 cross-root EVIDENCE channel for a name with NO same-root def: admit another root's
@@ -3466,7 +4574,7 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
                 // K≥2 gate cannot reach.) The tier ladder below still applies its unique-or-drop gate.
                 if( multiRoot && cand.empty() )
                 {
-                    for( NodeId c : it->second )
+                    for( NodeId c : *baseIds )
                     {
                         if( !langCompatible( ing.symbols[c].lang, r.lang ) || sameRoot( c, r.fileId ) )
                         {
@@ -3605,7 +4713,10 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
                 //
                 // H4 V3 M-3: `canonical` belongs in the same rescue, for the same reason — see the note above
                 // buildGraph ("the tier-3 canonical rescue").
-                if( cand.size() == 1 || narrowed || canonical ) { tier = cand; tierConf = 0.2f; }
+                // A lone survivor is a unique global only when the NAME is: a function-local def set aside by
+                // reachableByName still shares it, so that call declines like any other shared name (a bare `render()`
+                // of a destructured import must not fall to the one class method left once the closures step aside).
+                if( ( cand.size() == 1 && !localsYield ) || narrowed || canonical ) { tier = cand; tierConf = 0.2f; }
                 else
                 {
                     // DECLINED. Still no edge and still no guess — that precision rule is the ladder's point. What is gone is the silence: the decline counts on the
@@ -4116,14 +5227,36 @@ inline Graph buildGraph( const IngestResult& ing, const ScipOverlay* scip = null
         {
             continue;
         }
-
-        const auto it = byName.find( r.calleeName );
-        if( it == byName.end() )
+        if( ing.symbols[ derived ].lang == Lang::Ruby )
         {
-            continue;
+            derived = rubyBases.canonicalClass( ing, derived );   // a reopened class is ONE implementor, not one per open
+        }
+
+        // A Ruby base resolved by Ruby's own lookup: the bases are the classes whose constant it IS, read by constant
+        // (RubyBaseScope::classesByFqn — byName's decl/def collapse would hide a body-less Ruby class). nullptr ⇒ not
+        // a scoped Ruby base (every other language, or a Ruby site the join could not place) ⇒ byName stands.
+        const rw::SmallVec<NodeId, 2>* baseIds    = nullptr;
+        const std::string*             rubyScoped = rubyBases.resolvedBase( std::size_t( &r - ing.references.data() ) );
+        if( rubyScoped != nullptr )
+        {
+            const auto sit = rubyScoped->empty() ? rubyBases.classesByFqn.end() : rubyBases.classesByFqn.find( *rubyScoped );
+            if( sit == rubyBases.classesByFqn.end() )
+            {
+                continue;   // the tree never opens the written base — no in-tree row to list it under
+            }
+            baseIds = &sit->second;
+        }
+        else
+        {
+            const auto it = byName.find( r.calleeName );
+            if( it == byName.end() )
+            {
+                continue;
+            }
+            baseIds = &it->second;
         }
         baseCand.clear();
-        for( NodeId baseId : it->second )
+        for( NodeId baseId : *baseIds )
         {
             if( !isClassLike( ing.symbols[baseId].kind ) )
             {
@@ -4693,6 +5826,20 @@ inline bool filePathContainsRootRel( const IngestResult& ing, std::uint32_t file
     return !tail.empty() && filePathContains( rel, tail );
 }
 
+// The one indexed file a cwd-spelled path names EXACTLY, or kNoFile — see preferExactFile for the rule and its scope.
+inline std::uint32_t exactRootRelFile( const IngestResult& ing, std::string_view needle ) noexcept
+{
+    const std::string_view tail = needle.empty() ? std::string_view{} : selectorRootTail( ing, needle );
+    for( std::uint32_t fileId = 0; !tail.empty() && fileId < std::uint32_t( ing.files.size() ); ++fileId )
+    {
+        if( rootRelPath( ing, fileId ) == tail )
+        {
+            return fileId;
+        }
+    }
+    return kNoFile;
+}
+
 // shared "name" | "file:name" spec splitter (X9(b)) — the ONE disambiguation rule --around/--lego/
 // --edit-check (via resolveFocus, single lowest-id pick) and --callers/--impact (via
 // resolveAllByNameQualified, every match) now both route through, so a same-named-across-files symbol
@@ -4796,6 +5943,14 @@ inline AtSeed resolveAtSeed( const IngestResult& ing, std::string_view spec )
         if( filePathContainsRootRel( ing, fileId, r.fileHalf ) )
         {
             r.fileMatches.push_back( fileId );
+        }
+    }
+    if( r.fileMatches.size() > 1 )
+    {   // the exact-file preference (preferExactFile): a cwd-spelled path naming one indexed file exactly is that file
+        const std::uint32_t exact = exactRootRelFile( ing, r.fileHalf );
+        if( std::find( r.fileMatches.begin(), r.fileMatches.end(), exact ) != r.fileMatches.end() )
+        {
+            r.fileMatches.assign( 1, exact );
         }
     }
     if( r.fileMatches.empty() )     { r.fault = AtFault::FileUnmatched;  return r; }
@@ -5545,6 +6700,46 @@ inline void declToDefFollowThrough( const IngestResult& ing, std::string_view fi
     std::sort( sel.begin(), sel.end() );   // NodeId order - the contract every caller of this already relies on
 }
 
+// THE DOTTED SCOPE TIER (2026-10-01). Agents and docs write a method as `Class.method` (Python, JS, Java, the
+// comparison tables) or `Class#method` (Ruby, JSDoc), and every SYM verb answered "symbol not found" for a method the
+// Scope::name tier resolves at once. Probed LAST, only when every other tier matched nothing, and only for a spec with
+// no ':' (a file:name or Scope::name spelling is never re-read) and no '/' (a path): each '.' and '#' becomes "::" and
+// the Scope::name tier answers with exactly its own match (so a dotted spelling resolves precisely where its `::`
+// spelling does, and a namespace-qualified one does not, as `ns::Class::method` does not). Purely additive: a spec that resolved before resolves identically, because this runs only on an empty result.
+// Several matches are returned as they are (the verbs' defs= discloses a union; --edit-check refuses and lists them).
+// `found` is what the earlier tiers matched, returned untouched unless it is empty.
+inline std::vector<NodeId> resolveAllByDottedScope( const IngestResult& ing, std::string_view spec, std::vector<NodeId> found )
+{
+    const bool dotted = spec.find_first_of( ".#" ) != std::string_view::npos && spec.find_first_of( ":/" ) == std::string_view::npos;
+    if( !found.empty() || !dotted )
+    {
+        return found;
+    }
+    std::string scoped;
+    for( const char c : spec )
+    {
+        scoped += ( c == '.' || c == '#' ) ? std::string_view( "::" ) : std::string_view( &c, 1 );
+    }
+    return resolveAllByScopeQualified( ing, scoped );
+}
+
+// THE EXACT-FILE PREFERENCE (2026-10-01). A file half is a path SUBSTRING, so `./lib.cpp:sc` also named
+// `./sub/lib.cpp`, and no spelling could pick the root file alone — the --edit-check refusal printed a handle that was
+// refused again. A file half spelled from the cwd (the root as typed, then the path — the form the tool prints) that
+// equals one indexed file's root-relative path EXACTLY names that file: when it holds a match, the matches in other files
+// are dropped. A bare `lib.cpp` (no root prefix) keeps the substring reading, and so does a cwd-spelled path whose exact
+// file holds no match, so a spelling that resolved before resolves the same unless it named one file exactly.
+inline std::vector<NodeId> preferExactFile( const IngestResult& ing, std::string_view file, std::vector<NodeId> found )
+{
+    const std::uint32_t exact   = exactRootRelFile( ing, file );
+    const auto          inExact = [ & ]( NodeId id ) { return ing.symbols[ id ].fileId == exact; };
+    if( std::any_of( found.begin(), found.end(), inExact ) && !std::all_of( found.begin(), found.end(), inExact ) )
+    {
+        found.erase( std::remove_if( found.begin(), found.end(), [ & ]( NodeId id ) { return !inExact( id ); } ), found.end() );
+    }
+    return found;
+}
+
 // `unprovenDefCountOut` (H1, optional): the residue declToDefFollowThrough dropped — see its contract. Zero
 // on every path that never reaches the widening (an @FILE:LINE seed, a canonical id, a Scope::name tier, a
 // bare name), so a reader never has to ask whether the number is stale.
@@ -5594,11 +6789,12 @@ inline std::vector<NodeId> resolveAllByNameQualified( const IngestResult& ing, s
             out.push_back( s.id );
         }
     }
+    out = preferExactFile( ing, file, std::move( out ) );   // `./lib.cpp` names lib.cpp, not also sub/lib.cpp
 
     // #63: a header-qualified selector resolves to DECLARATIONS, which carry no call-graph edges.
     // Widen to the definitions they stand for. Full contract and its limits: declToDefFollowThrough above.
     declToDefFollowThrough( ing, file, name, out, unprovenDefCountOut );
-    return out;
+    return resolveAllByDottedScope( ing, spec, std::move( out ) );   // `Class.method` / `Class#method`, only when `out` is empty
 }
 
 // ─── MEMBER VARIABLES: `Owner.field` selection + per-site use resolution (the member-variable round, card A3) ─
@@ -7083,6 +8279,63 @@ inline std::vector<NodeId> transitiveCallersDepth( const Graph& g, std::span<con
 }
 inline std::vector<NodeId> transitiveCallers( const Graph& g, std::span<const NodeId> seeds ) { return transitiveCallersDepth( g, seeds, nullptr ); }
 
+// ── Depth-labelled --impact (0.6.5) — the hop depth the walk above already records, put on the listing ──────
+// A flat blast radius cannot tell a direct caller from a four-hop dependent, and a page window cut over a
+// PageRank-only order drops rows of every depth at once, so a capped answer had no clean boundary. Both
+// helpers read transitiveCallersDepth's depthOut; neither walks the graph again.
+//
+// The ORDER: hop depth first (1 = calls a seed directly), then the order the listing always had within a depth
+// (PageRank descending, node id ascending). Ranked BEFORE the page window cuts (docs/METHODOLOGY.md §9.1), so a
+// cut drops the deepest rows first and a capped answer is complete through every depth its rows pass.
+inline void orderByDepthThenRank( std::vector<NodeId>& show, const std::vector<std::uint32_t>& depth, const std::vector<float>& rank )
+{
+    EXPECTS( depth.size() == rank.size(), "depth and rank are both indexed by node id" );
+    std::sort( show.begin(), show.end(), [ & ]( NodeId a, NodeId b )
+               {
+                   if( depth[a] != depth[b] )
+                   {
+                       return depth[a] < depth[b];
+                   }
+                   return rank[a] != rank[b] ? rank[a] > rank[b] : a < b;
+               } );
+}
+
+// The per-depth counts over the FULL reach set (never the page): element k is the number of reached nodes first
+// reached at hop k+1. A BFS reaches hop k only through a node at hop k-1, so every element is non-zero and the
+// elements sum to reach.size() — the root's by_depth= therefore partitions reaches= exactly.
+inline std::vector<std::uint32_t> depthCounts( std::span<const NodeId> reach, const std::vector<std::uint32_t>& depth )
+{
+    std::vector<std::uint32_t> counts;
+    for( NodeId n : reach )
+    {
+        const std::uint32_t d = depth[n];
+        ASSUME( d >= 1, "transitiveCallersDepth: a returned node is never a seed, so its depth is at least 1" );
+        if( counts.size() < d )
+        {
+            counts.resize( d, 0 );
+        }
+        ++counts[d - 1];
+    }
+    ENSURES( std::all_of( counts.begin(), counts.end(), []( std::uint32_t c ) { return c != 0; } ), "BFS depths are contiguous from 1" );
+    return counts;
+}
+
+// The XML row's d=, RUN-LENGTH: printed on the first row of the emitted window and on every row whose depth differs from
+// the row before it; empty otherwise (the legend: a row without d= has the depth of the row above it). Measured on this
+// repo's own --impact answers (0.6.5 lane report): d= on every row cost 240 B on a 40-row page (+4.9..5.9%), the run form
+// 6..24 B (one per depth shown), and the depth is still unambiguous because the rows are emitted in depth order. The JSON
+// and columnar dialects carry it on every row / as a dense column: a JSON object and a parallel array are read per entry.
+inline std::string depthRunAttrXml( std::span<const NodeId> show, const std::vector<std::uint32_t>& depth, std::size_t rowIndex, std::size_t windowBegin )
+{
+    EXPECTS( rowIndex < show.size() && windowBegin <= rowIndex );
+    const std::uint32_t d = depth[ show[ rowIndex ] ];
+    if( rowIndex != windowBegin && depth[ show[ rowIndex - 1 ] ] == d )
+    {
+        return {};
+    }
+    return " d=\"" + std::to_string( d ) + "\"";
+}
+
 // symbols transitively reachable FROM `seeds` via OUT-edges (everything the seeds call, transitively) — the
 // forward dual of transitiveCallers. Returns a per-node mask (seeds included). Used by --seams as testReach:
 // a cross-module edge u→v is exercised by a test iff testReach[u] (a test transitively reaches the caller).
@@ -7631,6 +8884,173 @@ inline ConnectResult connectSubgraph( const Graph& g, const std::vector<NodeId>&
     return res;
 }
 
+// 0.6.6 D1: WHICH definition of a many-definition terminal name --connect searches from. connectSubgraph takes one node
+// per terminal, and the callers used to hand it resolveFocus's single pick (the lowest id), so `--connect=main,escapeXml`
+// searched from the one `main` of 107 that happened to sort first (a Python bench script) and printed every terminal
+// <unconnected> beside a --path that joins main to escapeXml in 2 hops. The pick is now the definition that JOINS: every
+// definition of the name is scored by how many OTHER terminals it reaches within the radius on the same undirected view
+// connectSubgraph walks, then by the fewest summed hops; resolveFocus's pick wins a tie it is part of, the lowest id any
+// other tie. Two passes: the first scores against every definition of the other names, the second re-scores against the
+// picks the first made — the nodes connectSubgraph will actually search from. A name none of whose definitions reaches
+// another terminal keeps resolveFocus's pick (so <unconnected> there is true of EVERY definition). tiedOut[i] > 1 says
+// that many definitions joined exactly as well as the pick: the answer is about one of them, disclosed by the emitter
+// (ambiguous_terminal=), never a silent choice.
+inline std::vector<std::uint16_t> connectUndirectedDistances( const Graph& g, std::span<const NodeId> sources, std::uint32_t radius )
+{
+    const std::size_t N = g.wOutDeg.size();
+    std::vector<std::uint16_t> dist( N, connectcfg::kUnreachable );
+    const auto* inRo   = g.inEdges.rowOffsets();
+    const auto* inCi   = g.inEdges.colIndices();
+    const bool  haveIn = g.inEdges.rows() == N;                // the same degrade connectSubgraph takes
+    std::vector<NodeId> q;
+    q.reserve( 256 );
+    for( const NodeId src : sources )
+    {
+        if( src < N && dist[ src ] != 0 )
+        {
+            dist[ src ] = 0;
+            q.push_back( src );
+        }
+    }
+    const auto relax = [ & ]( std::uint16_t du, NodeId v )
+    {
+        if( v < N && dist[ v ] == connectcfg::kUnreachable )
+        {
+            dist[ v ] = std::uint16_t( du + 1 );
+            q.push_back( v );
+        }
+    };
+    for( std::size_t head = 0; head < q.size(); ++head )
+    {
+        const NodeId        u  = q[ head ];
+        const std::uint16_t du = dist[ u ];
+        if( du >= radius )
+        {
+            continue;
+        }
+        for( std::uint32_t k = g.outOff[ u ]; k < g.outOff[ u + 1 ]; ++k )
+        {
+            relax( du, g.outTargets[ k ] );
+        }
+        if( haveIn )
+        {
+            for( std::uint32_t k = inRo[ u ]; k < inRo[ u + 1 ]; ++k )
+            {
+                relax( du, inCi[ k ] );
+            }
+        }
+    }
+    return dist;
+}
+
+// One terminal's choice among its definitions, against the other terminals' distance maps: the candidate reaching the
+// most of them, then the fewest summed hops; `preferred` (resolveFocus's pick) wins a tie it is part of, the lowest id any
+// other tie (candidates ascend by id). reached == 0 ⇒ no candidate joins anything, and `chosen` is `preferred`.
+struct TerminalChoice { NodeId chosen = kNoNode; std::uint32_t reached = 0, hops = 0, tied = 1; };
+
+inline TerminalChoice scoreTerminalCandidates( std::span<const NodeId> candidates, NodeId preferred, std::size_t self,
+                                               const std::vector<std::vector<std::uint16_t>>& distFrom )
+{
+    TerminalChoice best{ preferred, 0, 0, 1 };
+    bool           bestIsPreferred = false;
+    for( const NodeId candidate : candidates )
+    {
+        std::uint32_t reached = 0, hops = 0;
+        for( std::size_t j = 0; j < distFrom.size(); ++j )
+        {
+            const bool reaches = j != self && candidate < distFrom[ j ].size() && distFrom[ j ][ candidate ] != connectcfg::kUnreachable;
+            reached += reaches ? 1u : 0u;
+            hops    += reaches ? distFrom[ j ][ candidate ] : 0u;
+        }
+        const bool isTie = reached > 0 && reached == best.reached && hops == best.hops;
+        if( reached > best.reached || ( reached > 0 && reached == best.reached && hops < best.hops ) )
+        {
+            best            = TerminalChoice{ candidate, reached, hops, 1 };
+            bestIsPreferred = candidate == preferred;
+        }
+        else if( isTie )
+        {
+            ++best.tied;
+            best.chosen     = ( candidate == preferred && !bestIsPreferred ) ? candidate : best.chosen;
+            bestIsPreferred = bestIsPreferred || candidate == preferred;
+        }
+    }
+    if( best.reached == 0 )
+    {
+        best = TerminalChoice{ preferred, 0, 0, 1 };
+    }
+    ENSURES( best.tied >= 1 );
+    return best;
+}
+
+inline void chooseJoiningTerminals( const Graph& g, const std::vector<std::vector<NodeId>>& defsPerTerminal, std::vector<NodeId>& picks,
+                                    std::vector<std::uint32_t>& tiedOut, std::uint32_t radius )
+{
+    EXPECTS( defsPerTerminal.size() == picks.size() );
+    const std::size_t T = picks.size();
+    tiedOut.assign( T, 1u );
+    const bool anyMany = std::any_of( defsPerTerminal.begin(), defsPerTerminal.end(), []( const std::vector<NodeId>& d ) { return d.size() > 1; } );
+    if( !anyMany || T < 2 )
+    {
+        return;   // one definition per name: nothing to choose, and no BFS is paid for
+    }
+    const std::uint32_t r = std::clamp( radius, connectcfg::kMinRadius, connectcfg::kMaxRadius );
+    const std::vector<NodeId> firstPicks = picks;
+    for( int pass = 0; pass < 2; ++pass )
+    {
+        std::vector<std::vector<std::uint16_t>> distFrom( T );
+        for( std::size_t j = 0; j < T; ++j )
+        {
+            distFrom[ j ] = pass == 0 ? connectUndirectedDistances( g, defsPerTerminal[ j ], r )
+                                      : connectUndirectedDistances( g, std::span<const NodeId>( &picks[ j ], 1 ), r );
+        }
+        std::vector<NodeId> next = picks;
+        for( std::size_t i = 0; i < T; ++i )
+        {
+            if( defsPerTerminal[ i ].size() > 1 )
+            {
+                const TerminalChoice choice = scoreTerminalCandidates( defsPerTerminal[ i ], firstPicks[ i ], i, distFrom );
+                next[ i ]    = choice.chosen;
+                tiedOut[ i ] = choice.tied;
+            }
+        }
+        picks = std::move( next );
+    }
+    ENSURES( picks.size() == T && tiedOut.size() == T );
+}
+
+// The CLI --connect and the MCP connect verb both resolve their specs with resolveFocus, then hand the picks here: one
+// call re-reads every spec's full definition set (the same resolver, so `file:name` narrows it exactly as before),
+// lets chooseJoiningTerminals move a many-definition pick onto the definition that joins, and returns the names whose
+// pick tied with another equally-joining definition, comma-joined in spec order ("" when none) — the root's
+// ambiguous_terminal= attribute. Specs whose name has one definition cost nothing and never move.
+template<class SpecList>
+inline std::string joinTerminalPicks( const IngestResult& ing, const Graph& g, const SpecList& specs, std::vector<NodeId>& picks, std::uint32_t radius )
+{
+    EXPECTS( specs.size() == picks.size() );
+    std::vector<std::vector<NodeId>> defsPerTerminal;
+    defsPerTerminal.reserve( specs.size() );
+    for( const auto& spec : specs )
+    {
+        defsPerTerminal.push_back( resolveAllByNameQualified( ing, std::string_view( spec ), nullptr ) );
+    }
+    std::vector<std::uint32_t> tied;
+    chooseJoiningTerminals( g, defsPerTerminal, picks, tied, radius );
+    std::string ambiguous;
+    for( std::size_t i = 0; i < picks.size(); ++i )
+    {
+        if( tied[ i ] > 1 && picks[ i ] < ing.symbols.size() )
+        {
+            if( !ambiguous.empty() )
+            {
+                ambiguous += ',';
+            }
+            ambiguous += ing.symbols[ picks[ i ] ].name;
+        }
+    }
+    return ambiguous;
+}
+
 // ---- community detection (--communities): one level of Louvain local-moving on the UNDIRECTED projection
 //      of the call graph (unit edge weights). Deterministic: nodes processed in id order; on a (near-)tie
 //      the move resolves to the LOWER community id; fixed pass cap; ankerl insertion-ordered maps. Returns
@@ -7887,11 +9307,16 @@ inline ZoomHierarchy multiLevelCommunities( const Graph& g, std::uint32_t maxTop
 // unresolvedOut totals (the map header's ambiguous=/unresolved=, same fold); counts_floor="1" stays LAST.
 inline std::string graphCountFloorAttrXml( const Graph& g )
 {
-    return graphGaugeAttrXml( g.ambOut, g.unresolvedOut, g.unindexedFiles ) + kGraphCountFloorAttrXml;
+    return graphGaugeAttrXml( g.ambOut, g.unresolvedOut, g.unindexedFiles, g.rubyBasesUnscoped ) + kGraphCountFloorAttrXml;
 }
 inline std::string graphCountFloorAttrJson( const Graph& g )
 {
-    return graphGaugeAttrJson( g.ambOut, g.unresolvedOut, g.unindexedFiles ) + kGraphCountFloorAttrJson;
+    return graphGaugeAttrJson( g.ambOut, g.unresolvedOut, g.unindexedFiles, g.rubyBasesUnscoped ) + kGraphCountFloorAttrJson;
+}
+// The legend clauses a root's absent-at-zero gauges call for, read off the same two fields the attribute is.
+inline GaugeClauses graphGaugeClauses( const Graph& g ) noexcept
+{
+    return GaugeClauses( g.unindexedFiles > 0, g.rubyBasesUnscoped > 0 );
 }
 
 // THE DECLINED-LIST INTERNER — tier 3's record of what a declined call could equally have meant, stored once per DISTINCT

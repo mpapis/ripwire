@@ -45,6 +45,17 @@ inline bool isBaseTypeNode( const char* nt ) noexcept
     return false;
 }
 
+// The base-type test for one base-clause child, by language. Ruby names a base with its OWN node kinds, and only Ruby
+// does: `class Child < Parent` hands the `superclass` clause a (constant), `class Derived < Space::Base` a
+// (scope_resolution). They are asked under a language test here, rather than added as rows of isBaseTypeNode's shared
+// table, because both kind names are generic enough to occur in another grammar with another meaning, and that table is
+// consulted for every base clause in every language. `class Dynamic < Struct.new( :a )` hands over a (call) and is
+// correctly nothing — a computed superclass is not a name this tool can resolve. test/rubyinheritcheck.sh.
+inline bool isBaseTypeNodeIn( const char* nt, Lang lang ) noexcept
+{
+    return lang == Lang::Ruby ? ( kindIs( nt, "constant" ) || kindIs( nt, "scope_resolution" ) ) : isBaseTypeNode( nt );
+}
+
 // Emit one inherit RawRef (derived → base) for a base-type node. startByte sits inside the class header
 // (the type node's own start), so the byte-span enclosing attribution binds fromSymbol = the derived class.
 inline void emitBaseRef( TSNode typeNode, std::uint32_t fileId, Lang lang, std::string_view src, std::vector<RawRef>& refs )
@@ -98,19 +109,150 @@ TSNode preprocValueNode( TSNode defineNode ) noexcept
     return fieldChild( defineNode, NodeField::Value );
 }
 
+// ---- a NAME BOUND TO A FUNCTION LITERAL owns that literal's body ------------------------------------------
+// `const f = (x) => {…}`, `M.f = function(x) … end`, a class-body `f = lambda self, x: g(x)`: the tags query
+// captures the BINDING (lexical_declaration / assignment_statement / assignment / pair / field) as the
+// definition, and none of those nodes owns a `body:` field. Before this table the symbol read as bodyless
+// everywhere — sigEndByte == endByte, `--callees=f` answered bodyless_defs="1", and every quality verb that
+// skips bodyless symbols skipped it (measured on a TS agent repo: ~2,100 arrow-const functions, 63 measured).
+//
+// ONE table, not a branch per language (CONTRIBUTING "Adding a language: common stays common"): which
+// languages capture such bindings, which node kinds are function literals, which fields carry a bound value,
+// which positional lists carry one, and which wrappers sit between the binding and the literal. A language
+// joins by adding its literal kind (and, if its grammar spells the value differently, its field) — never code.
+// Languages that do NOT capture `name = <literal>` as a definition at all (Go `var f = func…`, Kotlin, Swift,
+// Dart, PHP, Ruby, C# lambdas) are a different gap — the definition is missing, not its body — and stay out.
+struct FnLiteralBindingTable
+{
+    std::array<Lang, 4>             langs;        // grammars whose tags.scm captures `name = <function literal>` as a def (TSX parses as TypeScript)
+    std::array<std::string_view, 4> literals;     // node kinds that ARE a function literal — each owns its params and a `body:` field
+    std::array<NodeField, 2>        valueFields;  // fields that carry the bound value: JS/TS declarator/pair/field `value:`, JS/Python assignment `right:`
+    std::array<std::string_view, 1> valueLists;   // positional value lists — Lua `a = v`: the list's FIRST `value:` is the bound value (tags.scm anchors it)
+    std::array<std::string_view, 3> wrappers;     // cast/paren wrappers between binding and literal: `((x) => …) as T` / `satisfies T`
+    std::array<NodeField, 1>        bareParam;    // a literal's lone parameter spelled WITHOUT a list — JS/TS `x => …` — counts as one
+};
+inline constexpr FnLiteralBindingTable kFnLiteralBinding = {
+    { Lang::JavaScript, Lang::TypeScript, Lang::Lua, Lang::Python },
+    { "arrow_function", "function_expression", "function_definition", "lambda" },
+    { NodeField::Value, NodeField::Right },
+    { "expression_list" },
+    { "parenthesized_expression", "as_expression", "satisfies_expression" },
+    { NodeField::Parameter },
+};
+
+// the value `binding` binds, through the wrappers: a value field, else the first `value:` of a positional value
+// list child. Null when the node binds nothing.
+inline TSNode fnLiteralBoundValue( TSNode binding ) noexcept
+{
+    TSNode value = {};
+    for( const NodeField f : kFnLiteralBinding.valueFields )
+    {
+        if( value = fieldChild( binding, f ); !ts_node_is_null( value ) )
+        {
+            break;
+        }
+    }
+    for( std::uint32_t i = 0, n = ts_node_named_child_count( binding ); ts_node_is_null( value ) && i < n && i < 4; ++i )
+    {
+        // i < 4: a value list is a direct child of the assignment, after the name list — never deep in a long child run
+        if( const TSNode c = ts_node_named_child( binding, i ); extent::inSet( kFnLiteralBinding.valueLists, std::string_view( ts_node_type( c ) ) ) )
+        {
+            value = fieldChild( c, NodeField::Value );
+        }
+    }
+    for( int guard = 0; !ts_node_is_null( value ) && guard < 4 && extent::inSet( kFnLiteralBinding.wrappers, std::string_view( ts_node_type( value ) ) ); ++guard )
+    {
+        value = ts_node_named_child( value, 0 );   // the wrapped expression is a wrapper's first named child; the type follows it
+    }
+    return value;
+}
+
+// The literal a definition's @name is bound to, and the node that binds it. Walks UP from the name — the
+// binding for THIS name, so `const a = () => 1, b = () => 2` hands each name its own literal — and stops at the
+// captured def node. Null literal when the language is not in the table or the name binds no function literal.
+struct FnLiteralBinding
+{
+    TSNode literal;
+    TSNode binding;
+};
+inline FnLiteralBinding fnLiteralBoundTo( TSNode roleNode, TSNode nameNode, Lang lang ) noexcept
+{
+    if( !extent::inSet( kFnLiteralBinding.langs, lang ) )
+    {
+        return {};
+    }
+    TSNode binding = ts_node_parent( nameNode );
+    for( int hop = 0; !ts_node_is_null( binding ) && hop < 6; ++hop )
+    {
+        if( const TSNode value = fnLiteralBoundValue( binding ); !ts_node_is_null( value ) && extent::inSet( kFnLiteralBinding.literals, std::string_view( ts_node_type( value ) ) ) )
+        {
+            return { value, binding };
+        }
+        if( ts_node_eq( binding, roleNode ) )
+        {
+            break;
+        }
+        binding = ts_node_parent( binding );
+    }
+    return {};
+}
+
 // the def's body node: the `body:` field for every function/class grammar, and — macro-edges round — a
 // #define's `value:` (preproc_arg) replacement text. Adopting the value as the body gives a macro symbol a
 // real signature/body split (sigEnd = replacement start), which is ALSO what makes graph.h's decl/def
 // collapse treat an indexed macro as a DEFINITION (hasBody: endByte > sigEndByte) instead of a shadowable
 // forward decl. Kept out of captureTagsFacts (the file's densest dispatch point) behind one call.
-TSNode defBodyNodeOf( TSNode roleNode, SymKind kind ) noexcept
+//
+// A function/method whose def node owns no body and whose name is bound to a function literal
+// (kFnLiteralBinding) takes the LITERAL's body, and `literal` names it so params/cx/nest read from the
+// function itself rather than from the declaration around it (a typed const's annotation carries its own
+// formal_parameters ahead of the arrow); null for every other def. `span` narrows to the one binding when the def node binds several
+// names (`const a = …, b = …;`, a Lua table of function fields) so each name's calls attribute to it alone;
+// a def node that binds one name keeps its own span, byte-for-byte.
+struct DefBodyNodes
+{
+    TSNode body;      // null: a declaration
+    TSNode literal;   // the function literal the name is bound to — metrics read from it; null: not literal-bound
+    TSNode span;      // the node the symbol's byte/row span covers
+};
+inline DefBodyNodes defBodyNodeOf( TSNode roleNode, TSNode nameNode, SymKind kind, Lang lang ) noexcept
 {
     TSNode body = fieldChild( roleNode, NodeField::Body );
     if( ts_node_is_null( body ) && kind == SymKind::Macro )
     {
         body = fieldChild( roleNode, NodeField::Value );
     }
-    return body;
+    if( !ts_node_is_null( body ) || ( kind != SymKind::Function && kind != SymKind::Method ) )
+    {
+        return { body, {}, roleNode };
+    }
+    const auto [ literal, binding ] = fnLiteralBoundTo( roleNode, nameNode, lang );
+    if( ts_node_is_null( literal ) )
+    {
+        return { body, {}, roleNode };
+    }
+    const bool oneOfSeveral = !ts_node_eq( binding, roleNode ) && ts_node_named_child_count( roleNode ) > 1
+                              && ts_node_eq( ts_node_parent( binding ), roleNode );
+    return { fieldChild( literal, NodeField::Body ), literal, oneOfSeveral ? binding : roleNode };
+}
+
+// a def's parameter count, read from `metricNode` (the literal for a literal-bound name): its parameter list's
+// count, or one for a literal whose lone parameter has no list (`x => …`), which countParams cannot see.
+inline std::uint16_t paramCountOf( TSNode metricNode, bool literalBound )   // NOT noexcept — countParams allocates
+{
+    const std::uint16_t listed = countParams( metricNode );
+    if( listed != 0 || !literalBound )
+    {
+        return listed;
+    }
+    for( const NodeField f : kFnLiteralBinding.bareParam )
+    {
+        if( !ts_node_is_null( fieldChild( metricNode, f ) ) )
+        {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 // DART's body is a SIBLING, not a field and not a child. tree-sitter-dart emits `function_body` next to
@@ -297,7 +439,11 @@ void captureMacroBodyCalls( TSNode defineNode, std::uint32_t fileId, Lang lang, 
 // Capture base classes for the inheritance/Lego view: walk a class node's base clause and emit an
 // inherit RawRef per base (derived → base). startByte sits inside the class header, so the enclosing
 // attribution assigns fromSymbol = the derived class. Explicit-syntax langs: C++/TS/JS/Java/Python/Swift/
-// C#/PHP/Kotlin. Lua is deliberately absent and it is a DISCLOSED non-goal, not an omission: Lua inheritance IS
+// C#/PHP/Kotlin/Ruby. Ruby reuses the `superclass` clause name Java's extends clause already has, and
+// names its base with (constant)/(scope_resolution) — see isBaseTypeNodeIn. A Ruby MIXIN
+// (`include M` / `extend M` / `prepend M`) is NOT captured here, for the same reason the PHP note below
+// gives: it is a call in the class BODY, not a clause. Ruby's ancestor chain does hold included modules,
+// so that is a stated residue (test/rubyinheritcheck.sh floor (b)), not a claim it is not inheritance. Lua is deliberately absent and it is a DISCLOSED non-goal, not an omission: Lua inheritance IS
 // `setmetatable( Derived, { __index = Base } )`, an ordinary runtime call over an ordinary table, so there
 // is no syntax to read and a Lua corpus correctly reports no inheritance edges at all.
 //
@@ -352,9 +498,16 @@ void captureBases( TSNode classNode, std::uint32_t fileId, Lang lang, std::strin
         forEachChild( clause, clauseCursor.cur, [ & ]( TSNode bn )
         {
             const char* bt = ts_node_type( bn );
-            if( isBaseTypeNode( bt ) )                 // DIRECT: type node right under the clause
+            if( isBaseTypeNodeIn( bt, lang ) )         // DIRECT: type node right under the clause
             {
                 emitBaseRef( bn, fileId, lang, src, refs );
+                return true;
+            }
+            // Ruby has no wrapper: its `superclass` clause holds ONE expression, and anything but a constant is
+            // COMPUTED (`class Dynamic < Struct.new( :a )`). Descending into that (call) lands on its receiver
+            // `Struct` and minted an edge to it — the receiver is not the base (test/rubyinheritcheck.sh floor (a)).
+            if( lang == Lang::Ruby )
+            {
                 return true;
             }
             // WRAPPED: descend ONE level into a wrapper (extends_clause / implements_clause / type_list)
@@ -976,13 +1129,17 @@ inline std::string jsModuleLoadTarget( TSNode n, std::string_view src )
 
 // The bare header path inside a C-family include spelling: `"dir/x.h"` / `<dir/x.h>` → `dir/x.h`, with
 // isAngleOut set from the delimiter BEFORE it is stripped (angle = external ⇒ path-precise resolution
-// leaves it unresolved). Shared by the two C-family spellings so they can never drift apart:
+// leaves it unresolved). ONE function for both spellings, so they can never drift apart:
 //   * `#include` — preproc_include's `path` field, which is EXACTLY the delimited token;
 //   * `#import`  — preproc_call's `argument` field, a preproc_arg that runs to end-of-line and so can
 //     carry a trailing comment (`#import "Volumetrics.h"   // vol_skyColor`, real, MeshRenderer.metal).
 // Hence the CLOSING delimiter, not the end of the spelling, ends the path. A spelling with no recognised
 // opening delimiter (a macro include, `#include HEADER_MACRO`) is returned verbatim in quote-form — the
 // pre-existing behaviour, preserved byte-for-byte. Allocates a std::string → not noexcept.
+//
+// #358: this is now the DepDialect::CFamily normaliser's own body (src/ingest_importcap.h), reached from
+// one `@import.path` capture instead of two per-language extractors. It stays HERE rather than moving,
+// because this file is the section that owns the spelling vocabulary and it is the one reader left.
 std::string includePathOf( std::string_view spelling, bool& isAngleOut )
 {
     if( spelling.size() < 2 || ( spelling.front() != '"' && spelling.front() != '<' ) )
@@ -998,36 +1155,6 @@ std::string includePathOf( std::string_view spelling, bool& isAngleOut )
         return std::string( spelling.substr( 1 ) );   // unterminated — degrade to "everything after the opener"
     }
     return std::string( spelling.substr( 1, end - 1 ) );
-}
-
-// C/C++/ObjC `#include "x.h"` / `<x.h>` → the bare path, isAngle set from the delimiter. Its own
-// function for the same reason csharpUsingTarget, phpUseTarget and jsModuleLoadTarget are: one AST shape
-// per language keeps directiveTargetOf's grain at one branch per grammar spelling, instead of one branch
-// plus its own null-and-bounds ladder. Empty when the node carries no readable path field.
-inline std::string preprocIncludeTarget( TSNode n, std::string_view src, bool& isAngleOut )
-{
-    // No empty-guard: includePathOf( "" ) already returns "" through its own size < 2 arm, and leaves
-    // isAngleOut alone doing it. The guard that used to stand here was dead, and --quality-delta found it
-    // the way dead code is usually found — as a duplication, once the two call sites normalised alike.
-    return includePathOf( nodeFieldText( n, NodeField::Path, src ), isAngleOut );
-}
-
-// The `#import "x.h"` spelling under the C/C++ grammar. `#import` is `#include` + include-once, so it
-// MUST yield the same Include edge — this is the edge that connects a `.metal` shader to the FX headers
-// it pulls in (10 of the 45 shaders in the measured reference tree use it). Under the objc grammar it
-// already parses as preproc_include; under the C/C++ grammar there is no #import rule, so it lands as the
-// generic preproc_call: directive:(preproc_directive) `#import`, argument:(preproc_arg) `"x.h"` / `<x.h>`.
-// EVERY other preproc_call (`#pragma`, `#error`, `#warning`, an unknown directive) is not a physical
-// dependency — the directive-text check is what keeps them out, so this never widens the include graph
-// beyond #import.
-inline std::string preprocImportTarget( TSNode n, std::string_view src, bool& isAngleOut )
-{
-    if( nodeFieldText( n, NodeField::Directive, src ) != "#import" )
-    {
-        return {};
-    }
-    // preproc_arg runs to end-of-line, so the CLOSING delimiter ends the path — includePathOf's job.
-    return includePathOf( nodeFieldText( n, NodeField::Argument, src ), isAngleOut );
 }
 
 // ─── kParserVer 81: the four languages that had no directive branch at all ───────────────────────────
@@ -1295,17 +1422,22 @@ inline std::string rubyAutoloadTarget( TSNode n, std::string_view src, bool& sym
     return std::string( txt );
 }
 
-// If the node's field child is a bare identifier, its text; else empty. The field-child-is-an-identifier-
-// and-give-me-its-text shape recurs across grammars (elixirTarget, elixirDirectiveTarget, elixirAliasGroup,
-// and the Ruby readers below all open with it).
-inline std::string_view fieldIdentifierText( TSNode n, NodeField field, std::string_view src ) noexcept
+// If the node's field child is of node kind `kind`, its text; else empty. The field-child-of-one-kind-and-give-
+// me-its-text shape recurs across grammars: fieldIdentifierText below is its `identifier` case, and
+// ingest_binds.h's rubyFinalConstant its `constant` case. The kind stays a literal, so kindIs keeps its
+// compile-time length.
+template< std::size_t N >
+inline std::string_view fieldChildTextOfKind( TSNode n, NodeField field, const char ( &kind )[N], std::string_view src ) noexcept
 {
     const TSNode c = fieldChild( n, field );
-    if( ts_node_is_null( c ) || !kindIs( ts_node_type( c ), "identifier" ) )
-    {
-        return {};
-    }
-    return nodeTextOf( c, src );
+    return !ts_node_is_null( c ) && kindIs( ts_node_type( c ), kind ) ? nodeTextOf( c, src ) : std::string_view {};
+}
+
+// If the node's field child is a bare identifier, its text; else empty (elixirTarget, elixirDirectiveTarget,
+// elixirAliasGroup, and the Ruby readers below all open with it).
+inline std::string_view fieldIdentifierText( TSNode n, NodeField field, std::string_view src ) noexcept
+{
+    return fieldChildTextOfKind( n, field, "identifier", src );
 }
 
 // The two Ruby named-directive verb sets. `attributes` (plural) has no runtime meaning in base Rails
@@ -1914,46 +2046,45 @@ constexpr std::uint16_t kMaxImportContainerDepth = 256;
 // at all. Split out of captureIncludes so the walk that FINDS directives and the per-grammar table that
 // READS them stay separately readable — the walk is one shape, this is one branch per grammar spelling.
 //
-// Node types confirmed per grammar: C++ preproc_include (path field, "" local vs <> external); C++
-// preproc_call with directive `#import` (the C/C++ grammar has no #import rule — the objc grammar does,
-// and yields preproc_include there); Python import_statement/import_from_statement; Go/Swift
+// Node types confirmed per grammar: Python import_statement/import_from_statement; Go/Swift
 // import_declaration; Rust use_declaration + mod_item; C# using_directive; TS/JS call_expression for the
-// CommonJS `require("./x")` and dynamic `import("./x")` spellings. LEVER-B B0: non-C imports capture the
+// CommonJS `require("./x")` and dynamic `import("./x")` spellings; plus the kParserVer-81 four (bash
+// `command`, lua `function_call`, ruby `call`, elixir `call`). LEVER-B B0: non-C imports capture the
 // CLEAN written specifier via grammar child fields (module path / quoted specifier / use argument), not a
 // sliced clause — the sound resolver input.
+//
+// #358: the C-family rows are GONE from this list. C++ preproc_include (path field, "" local vs <>
+// external) and C++ preproc_call with directive `#import` are captured as `@import.path` by the grammar's
+// own query and read by the DepDialect::CFamily normaliser (src/ingest_importcap.h), so this function is
+// never asked about a C-family node. What is left is every language whose extraction needs the walk's own
+// frame state — which is also the list of languages that have NOT moved over yet.
 //
 // `lang` exists for exactly one branch: `call_expression` is a node type in most of our grammars, and a
 // C++ or Rust function that happens to be named `require` must never manufacture a dependency edge. The
 // language gate makes that impossible by construction rather than by relying on where the walk goes.
 //
-// `isAngle` is C/C++/ObjC only: `<x.h>` (external) vs `"x.h"` (quote), returned alongside the target so
-// path-precise resolution can leave angle includes unresolved. `isLazy` (kParserVer 72, TS/JS; Ruby since
-// parser version 82/83): true when `insideFn` says this call sits inside a closure container — see
-// kJsFunctionContainers, the Ruby closure kinds, and captureIncludes' `insideFn` propagation below — or when
-// the directive is a Ruby `autoload`. Allocates a std::string → not noexcept.
-// `isSymbolic` (parser version 82, Ruby only): the target is a CONSTANT resolved through the corpus's own
-// class/module index, never a path — see model.h Include::isSymbolic.
-struct DirectiveTarget { std::string target; bool isAngle; bool isLazy; bool isSymbolic; bool isReceiver; };
+// `isLazy` (kParserVer 72, TS/JS; Ruby since parser version 82/83): true when `insideFn` says this call sits
+// inside a closure container — see kJsFunctionContainers, the Ruby closure kinds, and captureIncludes'
+// `insideFn` propagation below — or when the directive is a Ruby `autoload`. Allocates a std::string →
+// not noexcept. `isSymbolic` (parser version 82, Ruby only): the target is a CONSTANT resolved through the
+// corpus's own class/module index, never a path — see model.h Include::isSymbolic.
+//
+// There is deliberately NO `isAngle` here any more. It was C-family-only (`<x.h>` vs `"x.h"`), the two arms
+// that set it are the ones #358 deleted, and the CFamily normaliser writes Include::isAngle straight onto
+// the record it builds (src/ingest_importcap.h). A field no path can set is a lie in the type, so it is
+// gone rather than documented as always-false.
+struct DirectiveTarget { std::string target; bool isLazy; bool isSymbolic; bool isReceiver; };
 
 // `insideFn` exists for exactly the same one branch `lang` does: whether the call_expression being read
 // sits inside a TS/JS function body, per captureIncludes' walk — meaningless (and ignored) everywhere else.
 DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src, Lang lang, bool insideFn )
 {
     std::string target;
-    bool        isAngle    = false;
     bool        isLazy     = false;
     bool        isSymbolic = false;
     bool        isReceiver = false;
 
-    if( kindIs( t, "preproc_include" ) )                       // C++/C/ObjC: exact file path
-    {
-        target = preprocIncludeTarget( n, src, isAngle );
-    }
-    else if( kindIs( t, "preproc_call" ) )                     // C++-grammar `#import "x.h"` (ObjC/Metal spelling)
-    {
-        target = preprocImportTarget( n, src, isAngle );
-    }
-    else if( kindIs( t, "import_statement" ) )                 // Python `import a` / TS `import … from 'x'`
+    if( kindIs( t, "import_statement" ) )                 // Python `import a` / TS `import … from 'x'`
     {
         // Prefer the grammar's specifier field over slicing the whole statement (LEVER-B B0: the resolver
         // needs the REAL written specifier, not the clause). Empirically confirmed node shapes:
@@ -2110,7 +2241,7 @@ DirectiveTarget directiveTargetOf( TSNode n, const char* t, std::string_view src
         // read), so there is no sound string→fileId rule to write, and a wrong narrow is worse than none.
         target = phpUseTarget( n, src );                                 // see phpUseTarget for the shape rationale
     }
-    return { std::move( target ), isAngle, isLazy, isSymbolic, isReceiver };
+    return { std::move( target ), isLazy, isSymbolic, isReceiver };
 }
 
 // Capture #include / import directives (physical dependencies) by walking the file's top-level nodes —
@@ -2298,7 +2429,7 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
         // `mod x { … }` is a container whose body holds `use`s. A walk that treated container-ness as a
         // reason to skip the read would silently drop every Rust module-file declaration in the corpus.
         // For every other container the read simply returns empty, so one uniform order covers all of them.
-        auto [ target, isAngle, isLazy, isSymbolic, isReceiver ] = directiveTargetOf( n, t, src, lang, frame.insideFn );
+        auto [ target, isLazy, isSymbolic, isReceiver ] = directiveTargetOf( n, t, src, lang, frame.insideFn );
 
         // parser version 82: every Ruby class/module OPEN is recorded for resolve.h's constant index — the span
         // (nesting by containment), the own-body bit, the name as written (model.h ConstOpen). `class`/`module`
@@ -2375,7 +2506,7 @@ void captureIncludes( TSNode root, Lang lang, std::uint32_t fileId, std::string_
             // is strict at the start, so that byte reads as outside the class — the nesting Ruby actually uses.
             const bool          superclassSite = ( lang == Lang::Ruby && kindIs( t, "superclass" ) );
             const std::uint32_t siteByte       = superclassSite ? ts_node_start_byte( ts_node_parent( n ) ) : ts_node_start_byte( n );
-            incs.push_back( { fileId, isAngle, lazy, symbolic, siteByte, valueUse, std::move( tgt ) } );
+            incs.push_back( { fileId, /*isAngle*/ false, lazy, symbolic, siteByte, valueUse, std::move( tgt ) } );
         };
         // The constant-USE dedupe (parser version 83 for receivers; arguments and rescue classes joined at 93). Key =
         // innermost open + the name as written; the FIRST occurrence in source order carries the byte. The lazy bit is

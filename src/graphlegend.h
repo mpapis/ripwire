@@ -39,6 +39,7 @@
 #include <utility>
 #include <cstdio>
 #include <string>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -72,7 +73,7 @@ inline std::pair<std::size_t, std::size_t> graphGaugeTotals( const std::vector<s
 
 // an agent correctly learns to skip. Gate: test/blindspotcheck.sh arms (A) value-equality and (B) absence.
 inline std::string graphGaugeAttrXml( const std::vector<std::uint32_t>& ambOut, const std::vector<std::uint32_t>& unresolvedOut,
-                                      std::size_t unindexedFiles = 0 )
+                                      std::size_t unindexedFiles = 0, std::size_t rubyBasesUnscoped = 0 )
 {
     const auto [amb, unresolved] = graphGaugeTotals( ambOut, unresolvedOut );
     char buf[160];
@@ -84,10 +85,16 @@ inline std::string graphGaugeAttrXml( const std::vector<std::uint32_t>& ambOut, 
     {
         rw::formatTo( buf, sizeof( buf ), " graph_ambiguous=\"{}\" graph_unresolved=\"{}\"", amb, unresolved );
     }
-    return buf;
+    std::string out( buf );
+    if( rubyBasesUnscoped > 0 ) // #325, absent at zero like graph_unindexed=
+    {
+        rw::formatTo( buf, sizeof( buf ), " ruby_bases_unscoped=\"{}\"", rubyBasesUnscoped );
+        out += buf;
+    }
+    return out;
 }
 inline std::string graphGaugeAttrJson( const std::vector<std::uint32_t>& ambOut, const std::vector<std::uint32_t>& unresolvedOut,
-                                       std::size_t unindexedFiles = 0 )
+                                       std::size_t unindexedFiles = 0, std::size_t rubyBasesUnscoped = 0 )
 {
     const auto [amb, unresolved] = graphGaugeTotals( ambOut, unresolvedOut );
     char buf[160];
@@ -99,7 +106,13 @@ inline std::string graphGaugeAttrJson( const std::vector<std::uint32_t>& ambOut,
     {
         rw::formatTo( buf, sizeof( buf ), ",\"graph_ambiguous\":{},\"graph_unresolved\":{}", amb, unresolved );
     }
-    return buf;
+    std::string out( buf );
+    if( rubyBasesUnscoped > 0 ) // #325, absent at zero like graph_unindexed=
+    {
+        rw::formatTo( buf, sizeof( buf ), ",\"ruby_bases_unscoped\":{}", rubyBasesUnscoped );
+        out += buf;
+    }
+    return out;
 }
 
 // The gauge's one-sentence definition, spliced into every floor legend below (and the verify / nonlocal-state /
@@ -125,7 +138,26 @@ inline constexpr const char* kGraphCountFloorLegend =
 inline constexpr const char* kGraphUnindexedLegend =
     "graph_unindexed=N is a third gauge: files no grammar could read (the map header's unindexed=), whose calls "
     "raise neither gauge above; absent when zero, and so is this sentence. ";
-inline const char* graphUnindexedLegend( bool on ) noexcept { return on ? kGraphUnindexedLegend : ""; }
+// #325's gauge: Ruby superclass references whose base stayed on the final-segment name rule. Rides every clause
+// graph_unindexed='s does, on the emitter's own condition (graph.h graphGaugeClauses), absent at zero with its attribute.
+inline constexpr const char* kRubyBasesUnscopedLegend =
+    "ruby_bases_unscoped=N (absent when zero, and so is this sentence): N Ruby superclass references had no superclass "
+    "directive at their class open, so each base was matched by its final name segment instead of Ruby's constant "
+    "lookup; an implementor or base-walk edge through one may name a same-named class elsewhere. ";
+
+// Which absent-at-zero gauge clauses a root calls for. Built from a bool so a caller that knows only the #66
+// gauge still reads the way it did; graph.h graphGaugeClauses( g ) fills both.
+struct GaugeClauses
+{
+    bool unindexed = false; // graph_unindexed= is on the root
+    bool rubyUnscoped = false; // ruby_bases_unscoped= is on the root
+    constexpr GaugeClauses( bool u = false, bool r = false ) noexcept : unindexed( u ), rubyUnscoped( r ) {}
+    constexpr bool any() const noexcept { return unindexed || rubyUnscoped; }
+};
+inline std::string graphUnindexedLegend( GaugeClauses on )
+{
+    return std::string( on.unindexed ? kGraphUnindexedLegend : "" ) + ( on.rubyUnscoped ? kRubyBasesUnscopedLegend : "" );
+}
 
 // The same sentence as its OWN XML comment, for the legends that are one closed <!-- ... --> literal rather
 // than a %s inside one. Wrapped, never re-spelled: a second copy of this sentence is the drift
@@ -144,9 +176,9 @@ inline const char* graphUnindexedLegend( bool on ) noexcept { return on ? kGraph
 // what it was written for. `on` is always the emitter's own g.unindexedFiles > 0, never a re-derivation.
 // Gate: test/blindspotcheck.sh arm (F) (attribute => clause, every surface, both dialects) and (G) (the
 // mirror: neither, on a corpus with nothing unindexed).
-inline std::string graphUnindexedLegendComment( bool on )
+inline std::string graphUnindexedLegendComment( GaugeClauses on )
 {
-    return on ? std::string( "<!-- " ) + kGraphUnindexedLegend + "-->" : std::string();
+    return on.any() ? std::string( "<!-- " ) + graphUnindexedLegend( on ) + "-->" : std::string();
 }
 
 // H5 (capture-audit 2026-09-04, lens 7 F-FLOOR-1) — the BRIEF floor clause for the graph-count verbs that
@@ -163,7 +195,7 @@ inline constexpr const char* kGraphCountFloorBriefLegend =
 // second printf argument so the nine emitters that splice the brief legend keep their format strings exactly
 // as they were - a new %s at nine call sites is nine chances to land the B4 partial fix, and
 // test/printffmtparitycheck.sh would only catch the ones that change bytes.
-inline std::string graphCountFloorBrief( bool hasUnindexed )
+inline std::string graphCountFloorBrief( GaugeClauses hasUnindexed )
 {
     return std::string( kGraphCountFloorBriefLegend ) + graphUnindexedLegend( hasUnindexed );
 }
@@ -233,7 +265,7 @@ inline constexpr const char* kCallCountUnitLegend =
 // The two clauses in the order every legend prints them, so a caller that just wants "the shared tail" cannot
 // get the order wrong. Returned by value (std::string) because the two constants cannot be concatenated at
 // compile time through `const char*`; every call site splices it once, into a legend built at most once per run.
-inline std::string graphCountDisclosure( bool hasUnindexed )
+inline std::string graphCountDisclosure( GaugeClauses hasUnindexed )
 {
     return std::string( kGraphCountFloorLegend ) + graphUnindexedLegend( hasUnindexed ) + kCallCountUnitLegend;
 }
@@ -575,6 +607,31 @@ inline constexpr const char* kDeclinedCallsTestGateLegend =
 // The clause and, where the gate declined in this graph, its gate sentence — the one spelling every declined_calls= emitter uses.
 inline std::string declinedCallsLegendWithGate( bool on, bool gateDeclined ) { return std::string( declinedCallsLegend( on ) ) + declinedCallsGateLegend( on && gateDeclined ); }
 
+// ── reference-as-value round (src/valuerefs.h, src/ingest_valuerefs.h) ─────────────────────────────────────────
+// Each clause rides ONLY a document that carries the attribute or rows it defines (value_refs= / <vrs>), so an answer
+// with no value reference keeps its bytes. What a row does NOT mean is said in the same breath: it is matched by name,
+// it is not a proven call, and no count or reach includes it.
+inline constexpr const char* kValueRefsCallersLegend =
+    "value_refs=N (absent when 0) counts <vr> rows: the function is USED AS A VALUE, not called: stored into a table, field or variable, or passed as an argument, matched by name. It is not a proven call; count= and every reach exclude it. <vrs total= shown= capped= next=> is their window (capped=\"1\": rows cut, next= pages every site). <vr in_id= bind= into= called_by=>: the enclosing symbol, the binding site file:line, where the value lands, and the functions that may call through that slot (a called parameter, or tbl[k]() / tbl.k() on the same declaration). ";
+inline constexpr const char* kValueRefsCalleesLegend =
+    "value_refs=N (absent when 0) counts <vr> rows: functions this one uses AS VALUES (stored or passed), matched by name, and with through= the ones it may call through a parameter or table (through= is the written callee). It is not a proven call; count= excludes them. <vrs total= shown= capped= next=> is their window. <vr to= def= bind= into= through= sites=>: the function, its definition, the binding site, where the value lands, the call through it, and how many binding sites one to=/through= pair joins. ";
+inline constexpr const char* kValueRefsReachLegend =
+    "value_refs=N (absent when 0) counts <vr> rows: SYM is USED AS A VALUE at bind= (stored into into= or passed), matched by name. It is not a proven call: reaches= and impact_reaches= exclude them, and a caller that runs it through that slot is not in the radius. <vrs total= shown= capped= next=> is their window; <vr in_id= bind= into= called_by=>: the enclosing symbol, the binding site, where it lands, functions that may call through it. ";
+inline constexpr const char* kValueRefsSafeDeleteLegend =
+    "value_refs=N (absent when 0): SYM is USED AS A VALUE N times (a table, field or argument holds it; matched by name, not a proven call). Each such site (a decorator row aside: a fact about the definition) is in uses=; any row keeps dead_code_candidate at 0 and risk off none-found: deleting SYM breaks the table even though no call reaches it. <vrs>/<vr in_id= bind= into= called_by=> list them. ";
+inline constexpr const char* kToValueRefsLegend =
+    "to_value_refs=N (absent when 0): to= is USED AS A VALUE N times (stored or passed, matched by name); a run through such a slot is not a proven call and is no hop here: the callers verb on to= lists the binding sites and called_by=. ";
+inline constexpr const char* kUsesValueRoleLegend =
+    "role=\"value\" (reference-as-value round): the function is USED AS A VALUE there, stored into a table, field or variable or passed as an argument, matched by name with the callers verb's own visibility rules. It is not a proven call; the callers verb shows where the value lands and who may call through it. A decorator row is a fact about the definition, not a site: the callers verb lists it, this verb does not. ";
+inline const char* usesValueRoleLegend( bool on ) noexcept { return on ? kUsesValueRoleLegend : ""; }
+inline const char* valueRefsLegend( bool on, bool callersSide ) noexcept
+{
+    return on ? ( callersSide ? kValueRefsCallersLegend : kValueRefsCalleesLegend ) : "";
+}
+inline const char* valueRefsReachLegend( bool on ) noexcept { return on ? kValueRefsReachLegend : ""; }
+inline const char* valueRefsSafeDeleteLegend( bool on ) noexcept { return on ? kValueRefsSafeDeleteLegend : ""; }
+inline const char* toValueRefsLegend( bool on ) noexcept { return on ? kToValueRefsLegend : ""; }
+
 // ONE absent-at-zero count attribute: ` name="N"`, or nothing at all when count is 0. declined_calls= below and
 // --skipped's extent_suspect_files=/macro_blanked_files= (root) and extent_suspect_syms=/macro_blanked= (<h> rows)
 // all spell through it, so the shape has one definition instead of a copy per verb.
@@ -601,6 +658,69 @@ inline std::string declinedCallsAttrXml( std::size_t declinedCalls )
 inline std::string declinedCallsKeyJson( std::size_t declinedCalls )
 {
     return declinedCalls > 0 ? ",\"declined_calls\":" + std::to_string( declinedCalls ) : std::string();
+}
+
+// ── declined_iface= on the callers and impact answers and their MCP twins (callhierarchy.h declinedIfaceCallsNaming) ──
+// Declined TypeScript calls that share their name with an interface or abstract signature. The resolver does not narrow
+// on a type annotation, so `r.match()` with `r: Router` is declined once `match` has several definitions, and the
+// interface's own answer could have no count for it. The match is by NAME (the receiver's type is not read), so a
+// counted call MAY go through the interface; the count is not a subset of declined_calls=. Absent at zero; its clause
+// rides exactly when the attribute does. No double hyphen anywhere, because it lands inside an XML comment.
+inline constexpr const char* kDeclinedIfaceLegend =
+    "declined_iface=K (absent when 0) counts declined TypeScript call SITES that share their called name with a method signature with no body in this tree (an interface or abstract member; an overload signature in the same class as its implementation is not one). It matches by NAME only: the receiver's type is not read, so a counted call MAY go through that interface or may be another same-named method (a string's match, say). The resolver does not narrow a call on a TypeScript type annotation, so a call through an interface-typed receiver is declined once the name has two or more definitions: it has no caller row and no share of count=, and declined_calls= may miss it (the bodyless signature can sit outside its candidates). It counts the declined calls that could have meant these definitions (or, for impact, a symbol in the radius) and those sharing the name of a signature among them, each once, so it is NOT a subset of declined_calls= and can exceed it; the uses verb on the called name lists the sites. ";
+inline const char* declinedIfaceLegend( bool on ) noexcept { return on ? kDeclinedIfaceLegend : ""; }
+inline std::string declinedIfaceAttrXml( std::size_t declinedIface )
+{
+    return countAttrXmlOrEmpty( "declined_iface", declinedIface );
+}
+inline std::string declinedIfaceKeyJson( std::size_t declinedIface )
+{
+    return countFieldOrEmpty( "declined_iface", declinedIface, /*json=*/true );
+}
+
+// ── Depth-labelled --impact (0.6.5): by_depth= on the root, d= on the rows ──────────────────────────────────────────
+// `counts` is graph.h depthCounts over the FULL reach set: element k counts the rows first reached at hop k+1. One
+// spelling per dialect, shared by the CLI --impact and its MCP twin so the two cannot drift. Absent when the reach set
+// is empty (reaches="0" has no depth to partition). The XML form spells each depth (`1:9,2:20`) rather than relying on
+// position: a reader never has to count commas to learn which depth a number belongs to.
+inline std::string byDepthField( std::span<const std::uint32_t> counts, bool json )
+{
+    if( counts.empty() )
+    {
+        return {};
+    }
+    std::string out = json ? ",\"by_depth\":[" : " by_depth=\"";
+    for( std::size_t k = 0; k < counts.size(); ++k )
+    {
+        out += json ? std::string( k ? "," : "" ) : ( k ? "," : "" ) + std::to_string( k + 1 ) + ":";
+        out += std::to_string( counts[k] );
+    }
+    out += json ? ']' : '"';
+    return out;
+}
+inline std::string byDepthAttrXml( std::span<const std::uint32_t> counts )
+{
+    return byDepthField( counts, false );
+}
+// The JSON twin is an array: element i is depth i+1 (a JSON consumer indexes it; the XML reader reads it).
+inline std::string byDepthKeyJson( std::span<const std::uint32_t> counts )
+{
+    return byDepthField( counts, true );
+}
+
+// The legend clause, one per dialect (the columnar form carries the depth as a dense column, not a row attribute).
+// Emitted INSIDE an XML comment: no double hyphen.
+inline constexpr const char* kImpactDepthLegend =
+    "d=N on <s>: hop depth (1 = calls SYM directly; the shortest call chain), printed on the first row and where it changes "
+    "(a row without d= has the depth above it). Rows run d=1 first, PageRank order within a depth, so a cut drops the deepest "
+    "rows first; by_depth=k:n,… counts reaches= per depth and sums to it, so a capped answer states the depth it stopped in. ";
+inline constexpr const char* kImpactDepthColumnarLegend =
+    "the depth column: each row's hop depth (1 = calls SYM directly; the shortest call chain). Rows run depth 1 first, "
+    "PageRank order within a depth, so a cut drops the deepest rows first; by_depth=k:n,… counts reaches= per depth and sums "
+    "to it, so a capped answer states the depth it stopped in. ";
+inline const char* impactDepthLegend( bool columnar ) noexcept
+{
+    return columnar ? kImpactDepthColumnarLegend : kImpactDepthLegend;
 }
 
 // ── #220 part 1 — imports_unresolved=, the FILE graph's own gauge (test/depsprecisecheck.sh, the #220 arms) ─────────
@@ -705,6 +825,22 @@ inline std::string impactTsImportLegend( std::uint64_t importsUnresolved, std::u
 inline constexpr const char* kUnprovenDefsLegend =
     "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs= and no row or count here includes them. A declaration widens to the definitions it stands for only where the definition is IN the named file, or its own file includes the named file, resolved path-precisely; a same-named body anywhere else is not evidence and is never served. Widen the selector to the bare NAME, or to Scope::name, to see them. ";
 inline const char* unprovenDefsLegend( bool on ) noexcept { return on ? kUnprovenDefsLegend : ""; }
+
+// ── cross_kind= on the callers/callees answers (comparison table hono-07; test/callerscheck.sh arm X) ──
+// The definitions a selector resolved to are of 2+ KINDS (a free function and unrelated methods sharing a name), so the
+// union the defs= clause describes mixes neighbours of things that are not the same API. Emitted exactly when the
+// attribute is, the unprovenDefsLegend( bool ) rule. G4: inside an XML comment, so no double hyphen.
+inline constexpr const char* kCrossKindLegend =
+    "cross_kind=kind:N,... (absent when every definition shares one kind) says the defs= definitions are of DIFFERENT kinds, N of each: the rows union the neighbours of all of them, so a row may reach a definition other than the one you mean. Narrow with a file:name selector. ";
+inline const char* crossKindLegend( bool on ) noexcept { return on ? kCrossKindLegend : ""; }
+inline std::string crossKindAttrXml( const std::string& value )
+{
+    return value.empty() ? std::string() : " cross_kind=\"" + value + "\"";
+}
+inline std::string crossKindKeyJson( const std::string& value )
+{
+    return value.empty() ? std::string() : ",\"cross_kind\":\"" + value + "\"";
+}
 
 // ── issue #60: the module-scope owner's clause, emitted exactly when a t="modscope" ROW is in the answer ──
 // A file-scope call (a top-level statement, or a call inside an anonymous callback body) used to have no

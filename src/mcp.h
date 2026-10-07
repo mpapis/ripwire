@@ -29,9 +29,14 @@
 #include <iostream>        // no longer used HERE (R4 retired the std::cin getline) — kept because downstream
                            // translation units have long picked <iostream> up through this header
 #include <string>
+#include <algorithm>       // std::find — the --mcp-tools duplicate check and the batch-served lookup
+#include <bit>             // std::popcount — the --mcp-tools profile check
+#include "infra/tablelookup.h"   // findByField — mcpToolIndex, the same row lookup wrap and ingest use
 #include <cstdlib>         // ::realpath — the workspace-pin canonicalization (mcpCanonRoot)
 #include <climits>         // PATH_MAX
 #include "infra/os.h"      // rw::os::getcwd — R2a: the launch-cwd assumed root (resolved once at startup)
+#include "rootguard.h"      // #350 layer 1: noProjectRootReason — the launch cwd a server may not assume
+#include "memguard.h"       // #350 layer 3: the per-call hard-limit refusal and the _memory_stop sentence
 
 namespace rw
 {
@@ -116,6 +121,96 @@ inline constexpr std::size_t kMcpVerbCount = 33;   // +1 lane/tc-sliceat: the `s
                                                    // `rank_by` and `affected` — the two --rank-by/--affected MCP twins
 static_assert( sizeof( kMcpVerbTable ) / sizeof( kMcpVerbTable[0] ) == kMcpVerbCount,
                "kMcpVerbTable size drifted from kMcpVerbCount — update both together (A4-S2)" );
+
+// ─── Tool subsets: `--mcp-tools=SPEC` ────────────────────────────────────────────────────────────────────
+// The full tools/list is ~46 KB (~11.6K tokens) for 33 tools, and a client that loads schemas eagerly pays it
+// at every session start whether a tool is ever called or not. `--mcp-tools=SPEC` lists fewer: SPEC is a comma
+// list of tool names and/or profile names (`core`, `full`), unioned. The DEFAULT stays the full catalog, and
+// `--mcp-tools=full` is the default spelled out: every byte the server sends is unchanged for either.
+//
+// A subset is a DISCOVERABILITY and byte decision, never a silent one: a tools/call naming a tool this server
+// does not list is REFUSED with the flag that enables it (mcpHiddenToolRefusal), and `initialize` says the
+// subset is in force (mcpToolSubsetNote). `batch` keeps answering its own sub-verbs whether or not they are
+// listed here — its description names them as ITS sub-verbs, and that stays true.
+//
+// Bit i of a mask is kMcpVerbTable[ i ].
+using McpToolMask = std::uint64_t;
+static_assert( kMcpVerbCount < 64, "McpToolMask holds one bit per kMcpVerbTable row" );
+inline constexpr McpToolMask kMcpAllToolsMask = ( McpToolMask{ 1 } << kMcpVerbCount ) - 1;
+
+// kMcpVerbTable's row for `name`, or kMcpVerbCount when the name is not an advertised tool.
+constexpr std::size_t mcpToolIndex( std::string_view name ) noexcept
+{
+    // Index loop, not findByField's row-pointer arithmetic: g++ 15 rejects the
+    // (char*)&row + offsetof folding under -fsanitize=address ("not a constant
+    // expression", mcp.h static_assert on 33 rows) — same values on every compiler.
+    for( std::size_t i = 0; i < kMcpVerbCount; ++i )
+    {
+        if( kMcpVerbTable[ i ].name == name )
+        {
+            return i;
+        }
+    }
+    return kMcpVerbCount;
+}
+
+// The named profiles. `members` is a comma list of tool names; "" means every tool.
+//
+// `core` is the loop the server's own `instructions` teach (kMcpServerInstructions names exactly seven tools:
+// explore, from_trace, impact, uses, edit_check, quality_delta, batch) plus fetch_body, the step its "Fetch bodies
+// only after ranked retrieval" sentence describes. With all seven listed the instructions text is unchanged.
+// grep, for, callers/callees and the other batch-served reads stay reachable as batch sub-queries.
+struct McpToolProfile
+{
+    std::string_view name;
+    std::string_view members;
+};
+inline constexpr McpToolProfile kMcpToolProfiles[] = {
+    { "core", "explore,batch,from_trace,impact,uses,fetch_body,edit_check,quality_delta" },
+    { "full", "" },
+};
+
+// The mask a profile's `members` list names (each name must be a tool: checked below at compile time).
+constexpr McpToolMask mcpProfileMask( std::string_view members ) noexcept
+{
+    if( members.empty() )
+    {
+        return kMcpAllToolsMask;
+    }
+    McpToolMask mask = 0;
+    while( !members.empty() )
+    {
+        const std::size_t      comma = members.find( ',' );
+        const std::string_view tool  = members.substr( 0, comma );
+        const std::size_t      toolIndex = mcpToolIndex( tool );
+        if( toolIndex < kMcpVerbCount )
+        {
+            mask |= McpToolMask{ 1 } << toolIndex;
+        }
+        members = ( comma == std::string_view::npos ) ? std::string_view{} : members.substr( comma + 1 );
+    }
+    return mask;
+}
+
+consteval bool mcpProfilesNameOnlyTools() noexcept
+{
+    for( const McpToolProfile& profile : kMcpToolProfiles )
+    {
+        std::size_t memberCount = profile.members.empty() ? kMcpVerbCount : 1;
+        for( const char c : profile.members )
+        {
+            memberCount += ( c == ',' ) ? 1 : 0;
+        }
+        if( static_cast<std::size_t>( std::popcount( mcpProfileMask( profile.members ) ) ) != memberCount
+            || mcpToolIndex( profile.name ) != kMcpVerbCount )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert( mcpProfilesNameOnlyTools(),
+               "a kMcpToolProfiles row names a tool kMcpVerbTable does not have, names one twice, or a profile is named like a tool" );
 
 // The @FILE:LINE line-seed sentence, SPLICED into every stanza whose selector resolves it (the
 // kExemplarSelectionRule pattern: one constant, nine descriptions, zero drift). This is the no-name
@@ -265,6 +360,98 @@ inline std::string mcpBatchServedVerbsList( bool gitVerbsOmitted )
     return out;
 }
 
+// "core, full (profiles); analyze, rank_by, … (tools)" — every name --mcp-tools accepts, in table order, for the
+// refusal that has to say what WOULD have been accepted.
+inline std::string mcpToolSpecNames()
+{
+    std::string names;
+    for( const McpToolProfile& profile : kMcpToolProfiles )
+    {
+        names += names.empty() ? "" : ", ";
+        names += profile.name;
+    }
+    names += " (profiles); ";
+    for( std::size_t toolIndex = 0; toolIndex < kMcpVerbCount; ++toolIndex )
+    {
+        names += toolIndex == 0 ? "" : ", ";
+        names += kMcpVerbTable[ toolIndex ].name;
+    }
+    return names + " (tools)";
+}
+
+// A parsed `--mcp-tools=SPEC`: the mask it names, or why it was refused ("" = accepted).
+struct McpToolSpec
+{
+    McpToolMask mask = 0;
+    std::string refusal;
+};
+
+// One name out of SPEC: a profile's mask, one tool's bit, or 0 for a name that is neither.
+inline McpToolMask mcpToolSpecTokenMask( std::string_view token ) noexcept
+{
+    for( const McpToolProfile& profile : kMcpToolProfiles )
+    {
+        if( token == profile.name )
+        {
+            return mcpProfileMask( profile.members );
+        }
+    }
+    const std::size_t toolIndex = mcpToolIndex( token );
+    return toolIndex < kMcpVerbCount ? McpToolMask{ 1 } << toolIndex : 0;
+}
+
+// Parse SPEC (argv — external input, so every rule is a VALIDATE, and a refusal names the fix). Names are unioned
+// (`core,slice` is core plus slice); a name typed twice, an empty name and an unknown name are each refused.
+inline McpToolSpec mcpParseToolSpec( std::string_view spec )
+{
+    McpToolSpec                   out;
+    std::vector<std::string_view> seen;
+    std::string_view              rest = spec;
+    for( bool more = true; more; )
+    {
+        const std::size_t      comma = rest.find( ',' );
+        const std::string_view token = rest.substr( 0, comma );
+        more = comma != std::string_view::npos;
+        rest = more ? rest.substr( comma + 1 ) : std::string_view{};
+
+        const McpToolMask tokenMask = mcpToolSpecTokenMask( token );
+        if( !VALIDATE( !token.empty(), "argv: a --mcp-tools list has a name between every pair of commas" ) )
+        {
+            out.refusal = "--mcp-tools=" + mcprefuse::cappedEcho( spec ) + " has an empty name (a stray comma); name tools or profiles: "
+                        + mcpToolSpecNames();
+        }
+        else if( !VALIDATE( std::find( seen.begin(), seen.end(), token ) == seen.end(), "argv: each --mcp-tools name is given once" ) )
+        {
+            out.refusal = "--mcp-tools names '" + mcprefuse::cappedEcho( token ) + "' twice; name each tool or profile once";
+        }
+        else if( !VALIDATE( tokenMask != 0, "argv: every --mcp-tools name is a profile or a tool" ) )
+        {
+            std::vector<std::string_view> known;
+            known.reserve( std::size( kMcpToolProfiles ) + kMcpVerbCount );
+            for( const McpToolProfile& profile : kMcpToolProfiles )
+            {
+                known.push_back( profile.name );
+            }
+            for( const McpVerbInfo& verb : kMcpVerbTable )
+            {
+                known.push_back( verb.name );
+            }
+            const std::string near = mcprefuse::nearestName( known, token );
+            out.refusal = "--mcp-tools: unknown tool '" + mcprefuse::cappedEcho( token ) + "'"
+                        + ( near.empty() ? std::string{} : " (did you mean '" + near + "'?)" ) + "; valid names: " + mcpToolSpecNames();
+        }
+        if( !out.refusal.empty() )
+        {
+            out.mask = 0;
+            return out;
+        }
+        seen.push_back( token );
+        out.mask |= tokenMask;
+    }
+    ENSURES( out.mask != 0 && ( out.mask & ~kMcpAllToolsMask ) == 0, "an accepted spec names at least one tool, and only tools" );
+    return out;
+}
+
 // ─── Protocol versions ───────────────────────────────────────────────────────────────────────
 inline constexpr std::string_view kMcpLatestProtocolVersion = "2025-11-25";
 inline constexpr std::string_view kMcpHttpFallbackProtocolVersion = "2025-03-26";
@@ -346,12 +533,17 @@ struct McpDispatchPolicy
     bool        editsAllowed = true;   // false = refuse the 3 edit verbs (remote default)
     std::string defaultRoot;        // "" = no stdio startup root given; else the canonicalized `ripwire <root> --mcp` root
     std::string assumedRoot;        // "" = no guessable root; else the canonicalized launch cwd (stdio, no startup root) — see above
+    std::string noRootReason;       // #350: why assumedRoot is empty when the launch cwd was a home/system directory, else ""
     bool        pinnedRootHasGit = true;   // see above — only read when pinnedRoot is non-empty
     bool        pinnedRootIsGitDir = false;   // see above — only read when pinnedRootHasGit is false
     // r2-LO: the legend session this transport can hold, or null. The stdio loop owns one (one client, one line at a
     // time); the HTTP transport passes none, so every answer there keeps its legend inline and the resource read that
     // switches a stdio session to legend="ref" only serves text. See legenddict.h.
     legenddict::LegendSession* legendSession = nullptr;
+    // --mcp-tools: bit i = kMcpVerbTable[ i ] is listed and callable. The whole catalog unless the flag narrowed it;
+    // toolSpec is the flag's value as typed, rendered only under a subset (the refusal and the instructions note).
+    McpToolMask toolMask = kMcpAllToolsMask;
+    std::string toolSpec;
 };
 
 // canonicalize a root path for the workspace-pin comparison: realpath when it resolves, else the string
@@ -370,21 +562,62 @@ inline std::string mcpCanonRoot( const std::string& root )
 // assumedRoot for the contract. Guarded here, once: "/" and $HOME itself are nobody's workspace (a
 // crawl of either is a mistake, not a smart default), and a getcwd failure degrades to "" — the
 // pre-R2a missing-path refusal, never a guess.
-inline std::string mcpResolveAssumedRoot()
+//
+// #350 layer 1 widened the guard from "/" and $HOME to every directory rootguard.h refuses (system trees, drive roots,
+// the parent of the home directories), and keeps the REASON: `noRootWhy` receives the one-line "no project root"
+// sentence, which the missing-path refusal then carries so a path-less request says why no root was assumed.
+inline std::string mcpResolveAssumedRoot( std::string* noRootWhy = nullptr )
 {
-    char cwdBuf[ PATH_MAX ];
-    if( os::getcwd( cwdBuf, sizeof( cwdBuf ) ) == nullptr )
+    std::string launchCwd = rootGuardCwd();   // not const: returned, and a const local cannot be moved out
+    if( launchCwd.empty() )
     {
         return {};
     }
-    std::string       launchCwd = mcpCanonRoot( cwdBuf );   // not const: returned, and a const local cannot be moved out
-    const char* const homeEnv   = std::getenv( "HOME" );
-    const std::string homeCanon = homeEnv ? mcpCanonRoot( homeEnv ) : std::string{};
-    if( os::path_is_root( launchCwd ) || ( !homeCanon.empty() && launchCwd == homeCanon ) )   // "/", or a drive's "C:/"
+    std::string why = noProjectRootReason( launchCwd );
+    if( !why.empty() )
     {
+        if( noRootWhy != nullptr )
+        {
+            *noRootWhy = std::move( why );
+        }
         return {};
     }
     return launchCwd;
+}
+
+// #350 layer 1, the explicit half: "" when `path` may be answered, else the "no project root" sentence. `path` is a
+// directory, a file, or a registered `paths` workspace key (every member root is judged). A root equal to the server's
+// own startup root (defaultRoot, or the --listen pinnedRoot) is honoured: that one a human chose. Defined after the
+// workspace registry (mcpindex.h, via mcpverbs.h) so a key can be expanded to its roots.
+inline std::string mcpExplicitNoRootReason( const McpDispatchPolicy& policy, const std::string& path )
+{
+    if( path.empty() )
+    {
+        return {};
+    }
+    const std::string pinnedCanon = policy.pinnedRoot.empty() ? std::string() : mcpCanonRoot( policy.pinnedRoot );
+    const auto judge = [ & ]( const std::string& root ) -> std::string
+    {
+        const std::string canon = rootGuardCanon( root.c_str() );
+        if( canon == policy.defaultRoot || ( !pinnedCanon.empty() && canon == pinnedCanon ) )
+        {
+            return {};
+        }
+        return noProjectRootReason( canon );
+    };
+    const auto wsIt = mcpWorkspaceRegistry().find( path );
+    if( wsIt == mcpWorkspaceRegistry().end() )
+    {
+        return judge( path );
+    }
+    for( const WorkspaceRoot& r : wsIt->second )
+    {
+        if( std::string why = judge( r.real ); !why.empty() )
+        {
+            return why;
+        }
+    }
+    return {};
 }
 
 // R2a: rebind an OMITTED `path` to the assumed root (the softest tier — a pre-composed refusal, both
@@ -401,15 +634,18 @@ inline std::string mcpAssumeRootIfOmitted( const McpDispatchPolicy& policy, std:
     return "[assumed root: " + policy.assumedRoot + " — no path was given, so this answer is about the server's launch directory; pass path= to ask about another tree]";
 }
 
-// R2a: the `_assumed_root` envelope-sibling fragment (the mcpReingestField shape): "" when nothing was
-// assumed, else the JSON field ready to splice — keeps the ternary out of the response assembly.
-inline std::string mcpAssumedRootField( const std::string& note )
+// An envelope-sibling note fragment (the mcpReingestField shape): "" when there is nothing to say, else the JSON field
+// `key` ready to splice — keeps the ternary out of the response assembly. Two keys use it: R2a's `_assumed_root` (the
+// request omitted path= and the launch directory answered) and #350's `_memory_stop` (the index answering was cut by
+// the memory guard — every answer from it carries the sentence, because the payloads other than the map have no header
+// of their own to disclose the cut in, and the index is reused until the tree changes).
+inline std::string mcpEnvelopeNoteField( std::string_view key, const std::string& note )
 {
     if( note.empty() )
     {
         return {};
     }
-    return ",\"_assumed_root\":\"" + mcpdetail::jsonEscape( note ) + "\"";
+    return ",\"" + std::string( key ) + "\":\"" + mcpdetail::jsonEscape( note ) + "\"";
 }
 
 // is `candidatePath` the workspace root itself, or STRICTLY inside it — a path-COMPONENT prefix, so a
@@ -560,6 +796,229 @@ static_assert( mcpEditVerbCount() >= 3,
 inline bool mcpOmitsGitVerbs( const McpDispatchPolicy& policy ) noexcept
 {
     return !policy.pinnedRoot.empty() && !policy.pinnedRootHasGit;
+}
+
+// ── --mcp-tools: the subset this server lists, and the three places a subset must speak for itself ─────────────
+// A subset is in force iff the mask is not the whole catalog: `--mcp-tools=full` and no flag at all are the same
+// server, byte for byte.
+inline bool mcpToolSubsetActive( const McpDispatchPolicy& policy ) noexcept
+{
+    return policy.toolMask != kMcpAllToolsMask;
+}
+
+// Is `name` (a tool, or a dispatch alias such as pack_task) enabled by --mcp-tools? Independent of the git-only
+// omission (mcpOmitsGitVerbs): that one only hides verbs that could not answer, and they still dispatch.
+inline bool mcpToolEnabled( const McpDispatchPolicy& policy, std::string_view name ) noexcept
+{
+    for( const mcprefuse::McpVerbAlias& alias : mcprefuse::kMcpVerbAliases )
+    {
+        if( name == alias.alias )
+        {
+            name = alias.target;
+        }
+    }
+    const std::size_t toolIndex = mcpToolIndex( name );
+    return toolIndex < kMcpVerbCount && ( ( policy.toolMask >> toolIndex ) & 1u ) != 0;
+}
+
+// How many tools tools/list carries: the subset, less any git-only verb a pinned non-git listener omits.
+// Without a subset this is kMcpVerbCount, the number every unknown-tool refusal has always printed.
+inline std::size_t mcpAdvertisedToolCount( const McpDispatchPolicy& policy ) noexcept
+{
+    if( !mcpToolSubsetActive( policy ) )
+    {
+        return kMcpVerbCount;
+    }
+    std::size_t listedCount = 0;
+    for( const McpVerbInfo& verb : kMcpVerbTable )
+    {
+        const bool gitOmitted = mcpOmitsGitVerbs( policy ) && mcpIsGitOnlyVerb( verb.name );
+        listedCount += ( mcpToolEnabled( policy, verb.name ) && !gitOmitted ) ? 1 : 0;
+    }
+    ENSURES( listedCount <= kMcpVerbCount );
+    return listedCount;
+}
+
+// ── --mcp-tools: the instructions a subset serves ─────────────────────────────────────────────────────────────
+// kMcpServerInstructions tells an agent to call seven tools by name. Under a subset that leaves one out, that text
+// would send the agent to a tool this server refuses, so a subset serves the SAME text rebuilt from the sentences
+// below, keeping only the ones whose tool is listed. When every tool it names is listed (the `core` profile, and
+// `full`), the text is kMcpServerInstructions byte for byte.
+struct McpInstructionHint
+{
+    std::string_view tool;
+    std::string_view sentence;
+};
+inline constexpr McpInstructionHint kMcpInstructionHints[] = {
+    { "explore",       "Start a new task with explore." },
+    { "from_trace",    "Use from_trace for an error." },
+    { "impact",        "Use impact before changing a symbol." },
+    { "uses",          "Use uses to see its read/write/import sites." },
+    { "edit_check",    "Run edit_check after an edit." },
+    { "quality_delta", "Run quality_delta before declaring work done." },
+    { "batch",         "Use batch for several independent read queries in one turn." },
+};
+// The text around the tool-naming middle, cut out of the constant itself so the two can never disagree.
+inline constexpr std::size_t      kMcpInstructionsMiddleAt = kMcpServerInstructions.find( " Start a new task with explore;" );
+inline constexpr std::size_t      kMcpInstructionsTailAt   = kMcpServerInstructions.find( "Fetch bodies only after ranked retrieval." );
+static_assert( kMcpInstructionsMiddleAt != std::string_view::npos && kMcpInstructionsTailAt != std::string_view::npos
+                   && kMcpInstructionsMiddleAt < kMcpInstructionsTailAt,
+               "kMcpServerInstructions changed shape: re-cut kMcpInstructionsMiddleAt/TailAt and re-check kMcpInstructionHints" );
+
+// Every tool the instructions' middle names has a hint row, and every hint row's tool is a real tool: the subset
+// text drops exactly the sentences whose tool is hidden, so a tool named in the middle with no row would survive.
+consteval bool mcpInstructionHintsCoverTheMiddle() noexcept
+{
+    const std::string_view middle = kMcpServerInstructions.substr( kMcpInstructionsMiddleAt, kMcpInstructionsTailAt - kMcpInstructionsMiddleAt );
+    for( const McpVerbInfo& verb : kMcpVerbTable )
+    {
+        const std::string_view name = verb.name;
+        if( name == "for" )
+        {
+            continue;   // the English preposition: the text uses it as a word ("for an error"), never as the tool
+        }
+        bool named = false;
+        for( std::size_t at = middle.find( name ); at != std::string_view::npos; at = middle.find( name, at + 1 ) )
+        {
+            const char before = at == 0 ? ' ' : middle[ at - 1 ];
+            const char after  = at + name.size() < middle.size() ? middle[ at + name.size() ] : ' ';
+            const auto isWordChar = []( char c ) { return ( c >= 'a' && c <= 'z' ) || c == '_'; };
+            named = named || ( !isWordChar( before ) && !isWordChar( after ) );
+        }
+        bool hinted = false;
+        for( const McpInstructionHint& hint : kMcpInstructionHints )
+        {
+            hinted = hinted || hint.tool == name;
+        }
+        if( named != hinted )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert( mcpInstructionHintsCoverTheMiddle(),
+               "kMcpInstructionHints must have one row for each tool kMcpServerInstructions names, and no other" );
+
+inline std::string mcpInstructionsText( const McpDispatchPolicy& policy )
+{
+    bool everyHintListed = true;
+    for( const McpInstructionHint& hint : kMcpInstructionHints )
+    {
+        everyHintListed = everyHintListed && mcpToolEnabled( policy, hint.tool );
+    }
+    if( everyHintListed )
+    {
+        return std::string( kMcpServerInstructions );
+    }
+    std::string text( kMcpServerInstructions.substr( 0, kMcpInstructionsMiddleAt ) );
+    for( const McpInstructionHint& hint : kMcpInstructionHints )
+    {
+        if( mcpToolEnabled( policy, hint.tool ) )
+        {
+            text += " ";
+            text += hint.sentence;
+        }
+    }
+    text += " ";
+    text += kMcpServerInstructions.substr( kMcpInstructionsTailAt );
+    return text;
+}
+
+// The subset announces itself in `instructions` ("" without one): how many tools are listed, the flag that chose
+// them, and what a description naming an unlisted tool means. Descriptions are written for the full catalog (a
+// cross-reference, and batch's "other N advertised verbs" count, read against all of it), and this sentence is
+// what keeps them true under a subset.
+inline std::string mcpToolSubsetNote( const McpDispatchPolicy& policy )
+{
+    if( !mcpToolSubsetActive( policy ) )
+    {
+        return {};
+    }
+    return " TOOL SUBSET: this server lists " + std::to_string( mcpAdvertisedToolCount( policy ) ) + " of "
+         + std::to_string( kMcpVerbCount ) + " tools (--mcp-tools=" + policy.toolSpec
+         + "). Descriptions are written for all " + std::to_string( kMcpVerbCount )
+         + "; calling a tool not listed here is refused with the flag that enables it"
+         + ( mcpToolEnabled( policy, "batch" ) ? ", and batch still serves its own sub-verbs." : "." );
+}
+
+// The tools/call refusal for a tool the subset leaves out ("" when the tool is enabled, or is not a tool at all —
+// the unknown-tool refusal owns that). Names the restart that enables it, and the batch sub-query that answers it
+// now when batch is listed and serves that verb.
+inline std::string mcpHiddenToolRefusal( const McpDispatchPolicy& policy, std::string_view name )
+{
+    if( name.empty() || mcpToolEnabled( policy, name ) )
+    {
+        return {};
+    }
+    std::string_view tool = name;
+    for( const mcprefuse::McpVerbAlias& alias : mcprefuse::kMcpVerbAliases )
+    {
+        tool = ( name == alias.alias ) ? std::string_view( alias.target ) : tool;
+    }
+    if( mcpToolIndex( tool ) == kMcpVerbCount )
+    {
+        return {};
+    }
+    const bool batchServesIt = mcpToolEnabled( policy, "batch" )
+                            && std::find( std::begin( kBatchServedVerbs ), std::end( kBatchServedVerbs ), tool ) != std::end( kBatchServedVerbs );
+    return "tool '" + std::string( name ) + "' is not enabled on this server: it lists " + std::to_string( mcpAdvertisedToolCount( policy ) )
+         + " of " + std::to_string( kMcpVerbCount ) + " tools (--mcp-tools=" + policy.toolSpec + "). Restart it with --mcp-tools="
+         + policy.toolSpec + "," + std::string( tool ) + " or --mcp-tools=full"
+         + ( batchServesIt ? ", or ask for it now as a batch sub-query: queries=[{\"verb\":\"" + std::string( tool ) + "\",…}]" : std::string{} );
+}
+
+// tools/list under a subset: the full catalog's JSON with the unlisted stanzas removed. A FILTER over the one
+// place tools/list writes its tools (gitOnlyStanza's posture), so a subset never carries a second copy of a
+// description that could drift. Returns `resp` untouched without a subset — the default's bytes are the default's.
+//
+// Every stanza is an object `{"name":"…",…}` written by this file, so the scan needs only brace depth and string
+// state, and each object's name is its first field.
+inline std::string mcpFilterToolsList( std::string resp, const McpDispatchPolicy& policy )
+{
+    static constexpr std::string_view kToolsOpen = "\"tools\":[";
+    static constexpr std::string_view kNameOpen  = "{\"name\":\"";
+    const std::size_t                 open       = resp.find( kToolsOpen );
+    if( !mcpToolSubsetActive( policy ) || open == std::string::npos )
+    {
+        return resp;
+    }
+    const std::size_t arrayAt = open + kToolsOpen.size();
+    std::string       kept;
+    std::size_t       objectAt = arrayAt;
+    std::size_t       at       = arrayAt;
+    int               depth    = 0;
+    bool              inString = false;
+    for( ; at < resp.size() && !( depth == 0 && !inString && resp[ at ] == ']' ); ++at )
+    {
+        const char c = resp[ at ];
+        if( inString )
+        {
+            at += ( c == '\\' ) ? 1 : 0;
+            inString = c != '"';
+            continue;
+        }
+        inString = c == '"';
+        depth += ( c == '{' ) ? 1 : ( c == '}' ) ? -1 : 0;
+        if( c == '{' && depth == 1 )
+        {
+            objectAt = at;
+        }
+        if( c == '}' && depth == 0 )
+        {
+            const std::string_view object( resp.data() + objectAt, at + 1 - objectAt );
+            const bool opensWithName = object.starts_with( kNameOpen );
+            ASSUME( opensWithName, "every tools/list stanza this file writes opens with its name" );
+            const std::size_t nameEnd = object.find( '"', kNameOpen.size() );
+            ASSUME( nameEnd != std::string_view::npos, "every tools/list stanza this file writes closes its name string" );
+            if( mcpToolEnabled( policy, object.substr( kNameOpen.size(), nameEnd - kNameOpen.size() ) ) )
+            {
+                kept += kept.empty() ? "" : ",";
+                kept += object;
+            }
+        }
+    }
+    return resp.substr( 0, arrayAt ) + kept + resp.substr( at );
 }
 
 // ── r2-LO: the legend session's two MCP surfaces ─────────────────────────────────────────────────────────────
@@ -790,9 +1249,11 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                 resp = "{\"jsonrpc\":\"2.0\",\"id\":" + id +
                        ",\"result\":{\"protocolVersion\":\"" + std::string( negotiatedVersion ) +
                        "\",\"serverInfo\":{\"name\":\"ripwire\",\"version\":\"1.0\"},\"capabilities\":{\"tools\":{},\"resources\":{}},"
-                       "\"instructions\":\"" + mcpdetail::jsonEscape( std::string( kMcpServerInstructions )   // V3/F4: the
+                       "\"instructions\":\"" + mcpdetail::jsonEscape( mcpInstructionsText( policy )   // V3/F4: the; --mcp-tools: only hints for listed tools
                                                     + mcpLegendPointer( policy )   // r2-LO: the session dictionary, where a session exists
-                                                    + mcprefuse::gitOnlyOmissionNote( omitGitVerbs, policy.pinnedRootIsGitDir ) ) + "\"}}";  // omission announces itself, finding #7: qualified by which cause it is
+                                                    + mcpToolSubsetNote( policy )   // --mcp-tools: a subset announces itself
+                                                    + mcprefuse::gitOnlyOmissionNote( [ & ]( std::string_view verb ) { return omitGitVerbs && mcpToolEnabled( policy, verb ); },
+                                                                                      policy.pinnedRootIsGitDir ) ) + "\"}}";  // omission announces itself, finding #7: qualified by which cause it is
             }
         }
         else if( method == "tools/list" )
@@ -841,14 +1302,14 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                    // Same map `analyze` serves (same MEMBERSHIP/ORDER split), a different ranking SIGNAL.
                    "{\"name\":\"rank_by\",\"description\":\"The SAME architecture map 'analyze' serves, ranked by a different signal instead of plain PageRank. rank_by = pagerank (default, omit it — the CLI's own unbiased --rank-by=pagerank; 'analyze' can rank differently on a tree with uncommitted changes, where it biases toward your working set), authority (called by many good hubs — core APIs/utilities), hub (calls many good authorities — entrypoints/orchestrators), or rrf (fuses all three, Reciprocal Rank Fusion). churn and churn-decay are valid CLI --rank-by= values this tool REFUSES for now — they mine git history through a path this server does not build yet; use the CLI (ripwire <dir> --rank-by=churn) until then. The MEMBERSHIP/ORDER split and every other attribute follow the same rule as 'analyze'.\","
                    + mcprefuse::toolMetadataFor( "rank_by", pathIsRequired ) + "},"
-                   "{\"name\":\"find_symbol\",\"description\":\"A symbol's 1-hop neighborhood: the symbol (with a fetch_body handle) plus direct callers (calledBy) and callees (calls). Full transitive reach: 'impact'. Read/write/import sites, not just calls: 'uses'. JSON {symbol, calledBy, calls, defs, count, hop_tested, hop_untested, declined_calls, counts_floor}; both arrays are FLOORS and the payload says why. limit/offset page them. symbol = final name segment (add scope to disambiguate); " + std::string( kAtSeedDocClause ) + "\","
+                   "{\"name\":\"find_symbol\",\"description\":\"A symbol's 1-hop neighborhood: the symbol (with a fetch_body handle) plus direct callers (calledBy) and callees (calls). Full transitive reach: 'impact'. Read/write/import sites, not just calls: 'uses'. JSON {symbol, calledBy, calls, defs, count, hop_tested, hop_untested, declined_calls, counts_floor}; both arrays are FLOORS and the payload says why. valueRefs/valueCallees: value uses (tables, args), not a proven call. limit/offset page them. symbol = final name segment (add scope to disambiguate); " + std::string( kAtSeedDocClause ) + "\","
                    + mcprefuse::toolMetadataFor( "find_symbol", pathIsRequired ) + "},"
-                   "{\"name\":\"find_referencing_symbols\",\"description\":\"Direct (1-hop) callers of a symbol, each with a fetch_body handle. For the full transitive blast radius use 'impact', for read/write/import sites 'uses'. JSON {symbol, calledBy, defs, count, hop_tested, hop_untested, declined_calls, counts_floor}; calledBy is a FLOOR and the payload says why; declined_calls: same-named calls left unbound, not in count. limit/offset page it. " + std::string( kAtSeedShortClause ) + "\","
+                   "{\"name\":\"find_referencing_symbols\",\"description\":\"Direct (1-hop) callers of a symbol, each with a fetch_body handle. For the full transitive blast radius use 'impact', for read/write/import sites 'uses'. JSON {symbol, calledBy, defs, count, hop_tested, hop_untested, declined_calls, counts_floor}; calledBy is a FLOOR and the payload says why; declined_calls: same-named calls left unbound, not in count; valueRefs: value uses (tables, args), not a proven call, not in count. limit/offset page it. " + std::string( kAtSeedShortClause ) + "\","
                    + mcprefuse::toolMetadataFor( "find_referencing_symbols", pathIsRequired ) + "},"
                    // verifier N8: limit/offset are DECLARED here because they are HONORED (mcpPageArgs →
                    // pageWindow, the same trio the CLI --grep applies). This was the only paged CLI verb whose
                    // MCP twin disclosed capped:true at 100 hits with no knob to raise or walk past it.
-                   "{\"name\":\"grep\",\"description\":\"Trigram literal search; each hit annotated with its enclosing symbol (which function/class it is in). pattern = the literal; in=any lifts the span tiering (by default the tightest non-empty tier is served and what was held back rides as suppressed_comment/suppressed_string); limit/offset page the hits (first 100, has_more/next_offset end the loop). total/shown/capped/hits_capped and complete= are defined in the answer's own legend.\","
+                   "{\"name\":\"grep\",\"description\":\"Trigram literal search; each hit annotated with its enclosing symbol (which function/class it is in). Hits carry text; enclosing rows a fetch_body handle. pattern = the literal; in=any lifts the span tiering (default: tightest non-empty tier; rest rides as suppressed_comment/suppressed_string); limit/offset page the hits (first 100; has_more/next_offset end it). total/shown/capped/hits_capped and complete= are defined in the answer's legend.\","
                    + mcprefuse::toolMetadataFor( "grep", pathIsRequired ) + "},"
                    "{\"name\":\"cochange\",\"description\":\"Files that historically change together with this file — the co-edit partners. Fowler's Shotgun Surgery as change coupling. dep_capable=false means neither side could carry one (sh/md/json/binary), so surprising is undefined rather than informative. file = the file (a path SUFFIX is enough); limit/offset page the partners; the root names the mined window and its sub-window denominator.\","
                    + mcprefuse::toolMetadataFor( "cochange", pathIsRequired ) + "},"
@@ -882,14 +1343,14 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                    // paraphrased — this stanza used to describe an ordering the selector does not use.
                    "{\"name\":\"exemplar\",\"description\":\"BEFORE writing a function / method / class / struct / interface / variable, get the repo's single best-in-class instance of that kind to imitate — signature AND full body. " + std::string( kExemplarSelectionRule ) + ". Beats grep/find_symbol: those find A definition, this ranks every definition and returns the one worth copying. kind = fn|method|class|struct|iface|var, OR a task string (its top match's kind is used).\","
                    + mcprefuse::toolMetadataFor( "exemplar", pathIsRequired ) + "},"
-                   "{\"name\":\"quality_delta\",\"description\":\"Your PR self-check, run every time you think a change is DONE — pairs with the CLI-only --test-gate (names the tests to run + the untested blast radius; not MCP-exposed) to form the two-step pre-PR gate. Reports ONLY what your working tree made WORSE vs baseline, across 10 measured failure modes (complexity, verbosity, nesting, params, new duplication, new dead code, new public API surface, error-masking, short-horizon churn, new clone of a reused helper). Read-only; auto-compares vs git HEAD with no setup, or a pinned .ripwire_quality_baseline sidecar if present and not stale (baseline says which). sev=minor does not gate; acked findings stay suppressed until one worsens. at= is the commit compared at (+dirty = the working tree differed).\","
+                   "{\"name\":\"quality_delta\",\"description\":\"Your PR self-check, run every time you think a change is DONE — pairs with the CLI-only --test-gate (names the tests to run + the untested blast radius; not MCP-exposed) to form the two-step pre-PR gate. Reports ONLY what your working tree made WORSE vs baseline, across 11 measured failure modes (complexity, verbosity, nesting, params, new duplication, new dead code, new public API surface, error-masking, short-horizon churn, new clone of a reused helper, an added stub or TODO). Read-only; auto-compares vs git HEAD with no setup, or a pinned .ripwire_quality_baseline sidecar if present and not stale (baseline says which). sev=minor does not gate; acked findings stay suppressed until one worsens. at= is the commit compared at (+dirty = the working tree differed).\","
                    + mcprefuse::toolMetadataFor( "quality_delta", pathIsRequired ) + "},"
                    "{\"name\":\"quality_baseline\",\"description\":\"PIN the quality floor: writes .ripwire_quality_baseline stamped with the current git HEAD sha, snapshotting complexity / duplication / dead-code / API surface. Call once at the start of non-trivial work, then quality_delta compares against this pinned floor instead of HEAD. Side-effecting (writes a file) — skip it for a simple 'before I push' check, quality_delta already compares vs HEAD with zero setup.\","
                    + mcprefuse::toolMetadataFor( "quality_baseline", pathIsRequired ) + "},"
                    // §B6 M4: limit/offset are DECLARED here because they are HONORED (mcpPageArgs → pageWindow),
                    // which is what the legend has always instructed. Before this they were undeclared and
                    // silently ignored, so the two answers were byte-identical with and without them.
-                   "{\"name\":\"impact\",\"description\":\"IS IT SAFE TO CHANGE X? — the TRANSITIVE blast radius of a symbol via calls, ranked by PageRank. Use before modifying or deleting a symbol; it beats find_referencing_symbols (direct callers only), and 'uses' catches the read/write/import sites calls miss. Call edges are name-based, so reaches= is a FLOOR and this is a strong lead, not a proof — the answer's legend names every cause. The listing shows the top 40 by rank unless you raise it with limit=N (offset=M pages; has_more/next_offset end the loop). symbol = the name (file:name disambiguates); " + std::string( kAtSeedDocClause ) + "\","
+                   "{\"name\":\"impact\",\"description\":\"IS IT SAFE TO CHANGE X? — the TRANSITIVE blast radius of a symbol via calls, nearest first (d= hop depth), then PageRank. Use before modifying or deleting a symbol; it beats find_referencing_symbols (direct callers only), and 'uses' catches the read/write/import sites calls miss. Call edges are name-based, so reaches= is a FLOOR and this is a strong lead, not a proof — the answer's legend names every cause. The listing shows the first 40 unless you raise it with limit=N (offset=M pages; has_more/next_offset end the loop). symbol = the name (file:name disambiguates); " + std::string( kAtSeedDocClause ) + "\","
                    + mcprefuse::toolMetadataFor( "impact", pathIsRequired ) + "},"
                    "{\"name\":\"uses\",\"description\":\"The STATICALLY RESOLVABLE use-sites of a symbol, not just calls: role (call | read | write | import | extends), file:line, and enclosing symbol. Use to see the footprint before renaming or changing a name — find_referencing_symbols and impact follow only calls. external=\\\"1\\\" means no definition in the indexed tree; count=\\\"0\\\" is a real answer, and counts_floor=\\\"1\\\" says count= is a FLOOR (the legend names the causes). symbol = the bare name, the union across same-named defs (file:name narrowing is CLI-only); an @FILE:LINE seed serves the enclosing definition's sites and of= echoes it as typed. limit/offset page the sites.\","
                    + mcprefuse::toolMetadataFor( "uses", pathIsRequired ) + "},"
@@ -912,7 +1373,7 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                    + mcprefuse::toolMetadataFor( "edit_check", pathIsRequired ) + "},"
                    // The cross-branch + dark-content verbs. Read-only git plumbing, no index
                    // coupling for the first two (they read OTHER refs' blobs, which the index never ingested).
-                   + mcprefuse::gitOnlyStanza( omitGitVerbs, "{\"name\":\"whereis\",\"description\":\"WHERE DOES THIS CONTENT LIVE? Which branch's tree defines or mentions a symbol, HEAD first, with on-head=0 naming the case this verb exists for: content that lives only on a branch (a finished fix stranded on 1 of 30 refs). Each distinct blob is read once (content-addressed), so N branches cost about one tree. kind=def on a REF row is a LEXICAL heuristic (ref blobs are raw text, never ingested) — for HEAD's parsed answer use find_symbol/fetch_body. symbol = the name, or an @FILE:LINE seed; kind = optional ref-name substring filter, echoed as filter=; limit/offset page the hits (first 60). at= is HEAD's sha, always sha-only. Single-root; read-only.\","
+                   + mcprefuse::gitOnlyStanza( omitGitVerbs, "{\"name\":\"whereis\",\"description\":\"WHERE DOES THIS CONTENT LIVE? Which branch's tree defines or mentions a symbol, HEAD first, with on-head=0 naming the case this verb exists for: content that lives only on a branch (a finished fix stranded on 1 of 30 refs). Each distinct blob is read once (content-addressed), so N branches cost about one tree. kind=def on a REF row is a LEXICAL heuristic (ref blobs are raw text, never ingested) — for HEAD's parsed answer use find_symbol/fetch_body. symbol = the name, or an @FILE:LINE seed; kind = optional ref-name substring filter, echoed as filter=; limit/offset page the hits (first 60). at= is HEAD's sha; +dirty = changed paths read from the working tree (worktree=). Single-root; read-only.\","
                    + mcprefuse::toolMetadataFor( "whereis", pathIsRequired ) + "}," ) +
                    mcprefuse::gitOnlyStanza( omitGitVerbs, "{\"name\":\"stray_content\",\"description\":\"Per branch: the lines its own divergent work AUTHORED (vs its merge-base with HEAD) that the live line does NOT have. Four verdicts (unmerged+superseded+merged+unknown=refs): v=unmerged is genuinely absent; v=superseded means the live line re-implemented the work — the case `git cherry` structurally cannot see; merged branches are omitted and counted; v=unknown is a branch this scan could NOT analyse at all (no merge-base, unrelated history), not a fourth kind of divergence. Every file row carries its raw del/redone/sim evidence. Line-granular, not semantic. kind = optional ref-name substring filter, echoed as filter=; limit/offset page the refs. Single-root; read-only.\","
                    + mcprefuse::toolMetadataFor( "stray_content", pathIsRequired ) + "}," ) +
@@ -927,6 +1388,7 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                    "{\"name\":\"batch\",\"description\":\"ONE-TURN CONTEXT SWEEP: answer up to 16 heterogeneous READ sub-queries in a single call (the deterministic $0 counterpart of a parallel-search agent). queries = array over the SAME path, in EITHER grammar: {verb, ...args} objects, or the CLI --batch file's own \\\"verb:arg\\\" strings (queries=[\\\"for:parse the config\\\",\\\"callers:escapeXml\\\"]) - one grammar, both front doors; each verb is one of " + mcpBatchServedVerbsList( omitGitVerbs ) + " (plus the ALIASES callers=find_referencing_symbols and callees=find_symbol) with that verb's own args. The other " + std::to_string( batchExcluded ) + " advertised verbs are NOT batchable: side effects (the 3 edit verbs, quality_baseline), a heavy both-trees pass (quality_delta), no nesting (batch), whole-repo / cross-branch scope (situational_awareness, memory_recall, connect, explore — and its alias pack_task — from_trace, " + mcprefuse::batchGitOnlyExcludedNames( omitGitVerbs ) + "flags, doc_drift), and rank_by/affected (not yet swept into batch). Result is one <batch> of <q i verb ok> elements IN ORDER, each sub-answer verbatim in CDATA; a failing sub-query is an inline ok=0 err= entry and never fails the batch; identical payloads dedup; over 16 caps honestly.\","
                    + mcprefuse::toolMetadataFor( "batch", pathIsRequired ) + "}"
                    "]}}";
+            resp = mcpFilterToolsList( std::move( resp ), policy );   // --mcp-tools: the subset (unchanged without one)
             }
             catch( ... )
             {
@@ -1145,9 +1607,11 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             // tool-call result), costs the same one line, and can never corrupt a verb's own payload format
             // (JSON, XML, or plain text) — so it's the version of "append a trailing marker" that is actually
             // uniform across every verb, per the requirement.
+            std::string memoryStopNote;   // #350: set by indexStamp when the index answering this request is memory-guard partial
             const auto indexStamp = [ & ]( const std::string& root ) -> std::string
             {
                 const McpIndex& mix = getIndex( root );
+                memoryStopNote = mix.ing.memoryStop.isSet() ? memguard::softStopLine( mix.ing ) : std::string();
                 char buf[ 96 ];
                 rw::formatTo( buf, sizeof( buf ), "[index: files={} symbols={} hash={:08x}]",
                                 mix.ing.files.size(), mix.ing.symbols.size(),
@@ -1159,12 +1623,21 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             // tree STATE answered, `_reingest` what the server had to DO to get there. Contract on
             // McpIndex::incrementalPasses, gate test/mcpincrementalcheck.sh. Read BEFORE the verb runs.
             const std::uint64_t passesAtEntry = mcpIndexSlot().incrementalPasses;
+            // #350: ingests INSIDE a tool (a quality snapshot, a baseline, an edit check) and the background prefetch
+            // record their memory-guard stops here; a count that grew during this request means the answer may rest on
+            // a partial ingest even when the resident index is whole, and the envelope says so (textResult).
+            const std::uint32_t stopsAtEntry = memguard::stopCounts().recorded.load( std::memory_order_relaxed );
             const auto textResult = [ & ]( const std::string& text )
             {
                 // stamp FIRST, then the pass count: on a verb that never touched the index, building the
                 // stamp is what forces the rebuild, and one `+` chain would not sequence those two reads.
                 const std::string stamp = indexStamp( path );
-                // R2a: `_assumed_root` — a third envelope sibling (mcpAssumedRootField), emitted ONLY when
+                if( memoryStopNote.empty() && memguard::stopCounts().recorded.load( std::memory_order_relaxed ) > stopsAtEntry )
+                {
+                    memoryStopNote = "the memory guard stopped an ingest this answer depends on (inside this tool, or the "
+                                     "background snapshot), so it may be incomplete — " + std::string( memguard::kOverride );
+                }
+                // R2a: `_assumed_root` — a third envelope sibling (mcpEnvelopeNoteField), emitted ONLY when
                 // the request omitted `path` and the launch-cwd default answered.
                 // Card A3: `_fresh` — a fourth sibling, on EVERY response, because it is the one of these
                 // an agent needs without having asked for it: does this answer still describe the tree I am
@@ -1196,14 +1669,28 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                 return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\""
                      + mcpdetail::jsonEscape( *body ) + "\"}],\"_index\":\"" + mcpdetail::jsonEscape( stamp )
                      + "\"" + mcpReingestField( passesAtEntry ) + mcpFreshFields( passesAtEntry )
-                     + mcpAssumedRootField( assumedRootNote ) + "}}";
+                     + mcpEnvelopeNoteField( "_assumed_root", assumedRootNote ) + mcpEnvelopeNoteField( "_memory_stop", memoryStopNote ) + "}}";
+            };
+            // #350: a refusal composed after an ingest the memory guard cut may name a false cause ("no git HEAD" for a
+            // HEAD tree that was only partly read) — so every error built after a stop carries the guard's sentence too
+            const auto memoryStopSuffix = [ & ]( std::string_view msg ) -> std::string
+            {
+                if( memguard::stopCounts().recorded.load( std::memory_order_relaxed ) <= stopsAtEntry || msg.find( "memory guard" ) != std::string_view::npos )
+                {
+                    return {};
+                }
+                return "; the memory guard stopped an ingest this request ran, which may be the real cause — " + std::string( memguard::kOverride );
             };
             const auto errResult = [ & ]( int code, const char* msg )
-            { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + std::to_string( code ) + ",\"message\":\"" + msg + "\"}}"; };
+            {
+                const std::string suffix = memoryStopSuffix( msg );
+                return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + std::to_string( code ) + ",\"message\":\"" + msg
+                     + mcpdetail::jsonEscape( suffix ) + "\"}}";
+            };
             // dynamic-message variant (edit verbs build refusal messages that embed symbol names / candidate
             // file:line lists) — JSON-escape so a path with a quote or a control byte can't corrupt the response.
             const auto errResultMsg = [ & ]( int code, const std::string& msg )
-            { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + std::to_string( code ) + ",\"message\":\"" + mcpdetail::jsonEscape( msg ) + "\"}}"; };
+            { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":" + std::to_string( code ) + ",\"message\":\"" + mcpdetail::jsonEscape( msg + memoryStopSuffix( msg ) ) + "\"}}"; };
             // §B6 M8: the shared not-found renderers, bound to THIS request's index. Seven verbs on both
             // arms answered a bare "symbol not found" — no echo of what the caller typed, no near-miss —
             // while the CLI twin has carried both since A3-F16a and the `flags` verb below carries both
@@ -1215,6 +1702,24 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             { return mcprefuse::notFound( getIndex( path ).ing, "symbol", spelling, mcprefuse::notFoundHintFor( name, "symbol" ) ); };
             const auto notFoundKind = [ & ]( std::string_view noun, std::string_view spelling ) -> std::string
             { return mcprefuse::notFound( getIndex( path ).ing, noun, spelling ); };
+            // Fix list #2 (2026-10-01), the CLI twin's parity: a not-found keeps its -32602 refusal and ALSO carries the
+            // answer document the CLI prints on stdout (selectorrefuse.h writeNotFoundAnswer) in error.data.answer, with a
+            // working-tree rename offered first in both the message and the document. `msg` is the verb's own refusal
+            // sentence; the rename clause goes right after its quoted echo. The document's echo is cappedEcho'd like the
+            // message's, so a 400 KB selector cannot mint a 400 KB frame (mcpw3fixcheck NIT [symbol]).
+            const auto notFoundAnswered = [ & ]( std::string msg, NotFoundAnswer answer, bool json ) -> std::string
+            {
+                msg = withRenameClause( std::move( msg ), answer.near, answer.missing );   // the batch arm's rule too
+                std::string doc = captureXml( [ & ]( std::FILE* f ) { writeNotFoundAnswer( f, answer, json ); } );
+                while( !doc.empty() && doc.back() == '\n' ) { doc.pop_back(); }
+                return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":-32602,\"message\":\""
+                     + mcpdetail::jsonEscape( msg + memoryStopSuffix( msg ) ) + "\",\"data\":{\"answer\":\"" + mcpdetail::jsonEscape( doc ) + "\"}}}";
+            };
+            const auto notFoundNearOf = [ & ]( std::string_view spelling ) -> NotFoundNear
+            {
+                const IngestResult& nIng = getIndex( path ).ing;
+                return notFoundNear( nIng, spelling, nIng.realPaths.empty() ? path : std::string() );
+            };
 
             // success envelope for an edit verb: the JSON payload as text content + the fresh _index stamp
             // (the index was just invalidated, so indexStamp() rebuilds and reports the NEW post-edit state).
@@ -1246,7 +1751,16 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             // A11: the additive `paths` array — 2+ roots resolve to a registered
             // workspace key that REPLACES `path` for this request; a 1-element array degrades to that path.
             // `path` and `paths` together is a usage error. Single `path` requests are untouched (back-compat).
-            bool pathsUsageError = false;
+            // --mcp-tools: a tool this server does not list is refused FIRST, naming the flag that enables it — its
+            // arguments are not judged for a tool the caller cannot use here. Never dispatched, no getIndex().
+            const std::string hiddenToolRefusal = mcpHiddenToolRefusal( policy, name );
+            if( !hiddenToolRefusal.empty() )
+            {
+                DISCLOSE( Diagnostics::answerRefused, "a tools/call of a tool --mcp-tools left out answers an MCP error naming the flag that enables it" );
+                resp = errResultMsg( -32602, hiddenToolRefusal );
+            }
+            bool pathsUsageError = !hiddenToolRefusal.empty();
+            if( !pathsUsageError )
             {
                 // W3FIX M8: through the guarded ARRAY reader. `paths:5` used to read as absent, so the request
                 // fell through to `path` and was refused with "missing required field: path" — a field the
@@ -1333,6 +1847,21 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             // disclosed via textResult's `_assumed_root` sibling — precedence + guards live in
             // mcpAssumeRootIfOmitted / mcpResolveAssumedRoot, the full contract on McpDispatchPolicy.
             assumedRootNote = mcpAssumeRootIfOmitted( policy, path, pathsUsageError );
+
+            // ── #350 layer 1, the explicit half: a request's path= (or any root of a `paths` workspace) that IS $HOME, a
+            // filesystem root or a system tree is refused with the implicit case's own sentence — an agent fills path=
+            // from its session's cwd, so over MCP that path is no more a human's choice than the launch directory is
+            // (the #350 incident was exactly `grep path=$HOME`). The one exception is the root the server was STARTED
+            // on (`ripwire <root> --mcp`, or the --listen workspace): a human typed that. The server stays up.
+            if( !pathsUsageError )
+            {
+                if( const std::string noRoot = mcpExplicitNoRootReason( policy, path ); !noRoot.empty() )
+                {
+                    DISCLOSE( Diagnostics::answerRefused, "mcp: a request path that is a home/system directory is refused with an MCP error naming it" );
+                    resp            = errResultMsg( -32602, noRoot );
+                    pathsUsageError = true;   // the skip-flag: no dispatch, no getIndex(), no crawl
+                }
+            }
 
             // ── §B6 M3: does `path` name a readable DIRECTORY? ONE check, every verb, before dispatch ───────
             //
@@ -1510,7 +2039,9 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
             {
                 if( path.empty() )
                 {
-                    return mcprefuse::missingPathRefusal();
+                    // #350: from a home/system launch directory the missing path has a cause worth naming
+                    return policy.noRootReason.empty() ? mcprefuse::missingPathRefusal()
+                                                       : mcprefuse::missingPathRefusal() + "; " + policy.noRootReason;
                 }
                 return mcprefuse::missingFieldRefusal( name, argPresent );
             };
@@ -1526,6 +2057,23 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                 // try: an allocation excluded from the guard by the guard's own opening line. The
                 // `if( !pathsUsageError )` that used to gate the try from outside is now the first arm of the
                 // dispatch chain below, which is what makes room for this.
+                // #350 layer 3: over the memory guard's hard limit, no tool call starts work — the call is refused by
+                // name and the server stays up (a later call, after memory is released, is served). One footprint
+                // reading per tool call; nothing is measured on any other method.
+                // Over the line, the resident index is released first (it is usually most of the footprint) and the
+                // footprint read once more: under the line again, the call proceeds and rebuilds for its own root; still
+                // over, it is refused and the sentence says the server itself must be restarted.
+                if( const bool seamOver = memguard::requestSeamTrips(); !pathsUsageError && ( seamOver || memguard::overHardLimit() ) )
+                {
+                    releaseMcpIndexMemory();
+                    if( seamOver || memguard::overHardLimit() )
+                    {
+                        DISCLOSE( Diagnostics::answerRefused, "mcp: a tool call over the memory guard's hard limit, even with the index released, is refused with an MCP error naming the limit" );
+                        resp            = errResultMsg( -32000, memguard::hardStopLine( "session (this server's footprint)" )
+                                                                + "; the resident index was released and the server is still over it — restart the MCP server" );
+                        pathsUsageError = true;   // the skip-flag: no dispatch, no getIndex()
+                    }
+                }
                 if( !pathsUsageError && isMcpEditVerb( name ) )
                 {
                     if( std::string missingEditArg = missingArgMsg(); !missingEditArg.empty() )
@@ -1626,7 +2174,11 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                     resp = pagedResult( [ & ]( McpPageArgs pg )
                     {
                         const std::string j = symbolQueryJson( path, symbol, name == "find_referencing_symbols", pg );
-                        return j.empty() ? errResultMsg( -32602, notFoundSym( symbol ) ) : textResult( j );
+                        // Review M5: both twins answer a miss — find_referencing_symbols is --callers, find_symbol --callees.
+                        return j.empty() ? notFoundAnswered( notFoundSym( symbol ),
+                                                             NotFoundAnswer{ name == "find_referencing_symbols" ? "callers" : "callees",
+                                                                             { { "of", mcprefuse::cappedEcho( symbol ) } }, {}, notFoundNearOf( symbol ) }, true )
+                                         : textResult( j );
                     } );
                 }
                 else if( name == "grep" && !path.empty() && !pattern.empty() )
@@ -1865,7 +2417,8 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                         {
                             return errResult( -32603, "internal error: the impact answer buffer lost bytes — no answer served" );
                         }
-                        return answer->empty() ? errResultMsg( -32602, notFoundSym( symbol ) ) : textResult( *answer );
+                        return answer->empty() ? notFoundAnswered( notFoundSym( symbol ), NotFoundAnswer{ "impact", { { "of", mcprefuse::cappedEcho( symbol ) } }, {}, notFoundNearOf( symbol ) }, false )
+                                               : textResult( *answer );
                     } );
                 }
                 else if( name == "uses" && !path.empty() && !symbol.empty() )
@@ -1881,7 +2434,9 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                                                  return answer ? textResult( *answer )   // count="0" stays a valid answer
                                                                : errResult( -32603, "internal error: the uses answer buffer lost bytes — no answer served" );
                                              } )
-                                           : errResultMsg( -32602, refusal );
+                                           : usesRefusalIsNotFound( refusal )
+                                               ? notFoundAnswered( refusal, NotFoundAnswer{ "uses", { { "of", mcprefuse::cappedEcho( symbol ) } }, {}, notFoundNearOf( symbol ) }, false )
+                                               : errResultMsg( -32602, refusal );   // review M5: a not-found answers like --uses
                 }
                 else if( name == "affected" && !path.empty() && !files.empty() )
                 {
@@ -1919,8 +2474,17 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                 else if( name == "path_between" && !path.empty() && !from.empty() && !to.empty() )
                 {
                     const std::optional<std::string> answer = pathText( path, from, to );
+                    const auto pathNotFound = [ & ]
+                    {
+                        const IngestResult& pIng    = getIndex( path ).ing;
+                        const bool          fromBad = resolveAllByNameQualified( pIng, from ).empty();
+                        const bool          toBad   = resolveAllByNameQualified( pIng, to ).empty();
+                        return notFoundAnswered( pathEndpointRefusal( pIng, from, to ),
+                                                 NotFoundAnswer{ "path", { { "from", mcprefuse::cappedEcho( from ) }, { "to", mcprefuse::cappedEcho( to ) } },
+                                                                 fromBad && toBad ? "both" : fromBad ? "from" : "to", notFoundNearOf( fromBad ? from : to ) }, false );
+                    };
                     resp = !answer        ? errResult( -32603, "internal error: the path_between answer buffer lost bytes — no answer served" )
-                         : answer->empty() ? errResultMsg( -32602, pathEndpointRefusal( getIndex( path ).ing, from, to ) )
+                         : answer->empty() ? pathNotFound()
                                            : textResult( *answer );
                 }
                 // `connect` — symbols as a JSON string array (the schema form) or a comma-string (lenient);
@@ -2212,7 +2776,7 @@ inline McpDispatchResult dispatchMcpLine( const std::string& line, int topK, boo
                         // W3FIX M4: the callable ALIASES join the near-miss pool (a `packtask` typo should land
                         // on `pack_task`, which this server answers) — the printed COUNT below stays the
                         // advertised one, which is what "call tools/list for the N available tools" promises.
-                        const std::size_t advertisedCount = knownVerbs.size();
+                        const std::size_t advertisedCount = mcpAdvertisedToolCount( policy );   // --mcp-tools: the listed count
                         for( const mcprefuse::McpVerbAlias& alias : mcprefuse::kMcpVerbAliases )
                         {
                             knownVerbs.push_back( alias.alias );
@@ -2277,52 +2841,74 @@ inline void emitMcpStdioLineOverflowRefusal()
     std::fflush( stdout );
 }
 
-// stdio MCP loop: one JSON object per line. Returns the process exit code. `root`/`roots` are the
-// positional args `ripwire <root> --mcp` was started with (roots.size()>=2 = a multi-root workspace);
-// both default empty for the pre-X7 "no startup root" mode, in which every request must still name its
-// own `path` exactly as before. `root` mirrors `McpHttpConfig::root`; `roots` mirrors `::roots` — same
-// plumbing as runMcpHttp(), just building McpDispatchPolicy::defaultRoot instead of ::pinnedRoot (D3/D4).
-inline int runMcp( int topK, bool stable = false, bool noRedact = false,
-                   const std::string& root = std::string(), const std::vector<std::string>& roots = {} )
+// What `ripwire [root…] --mcp` hands the stdio loop — the stdio twin of mcpserver.h's McpHttpConfig. `root`/`roots` are
+// the positional args (roots.size()>=2 = a multi-root workspace); both empty for the pre-X7 "no startup root" mode, in
+// which every request must still name its own `path` exactly as before. toolMask/toolSpec are --mcp-tools, already
+// validated by main.cpp (the whole catalog by default).
+struct McpStdioConfig
 {
-    // MEASURE-FIRST instrumentation (RIPWIRE_MCP_TIMINGS, off by default → byte-identical + silent server, same
-    // discipline as ingest.cpp's RIPWIRE_CACHE_STATS). When set, emit ONE stderr TSV line per handled request:
-    //   ripwire-timing verb=<v> wall_ms=<f> rebuilt=<0|1>
-    // stderr only, so the JSON-RPC stdout stream is untouched and every determinism/protocol gate is unaffected.
-    // NOTE: the design specified a `--mcp-timings` CLI flag; cli.h/main.cpp are owned by a concurrent agent this
-    // round, so we use the env var instead (recorded in bench/PROFILE.md's appendix) — same zero-cost-off contract.
-    const bool timingsOn = std::getenv( "RIPWIRE_MCP_TIMINGS" ) != nullptr;
+    int                      topK     = 200;
+    bool                     stable   = false;
+    bool                     noRedact = false;
+    std::string              root;
+    std::vector<std::string> roots;
+    McpToolMask              toolMask = kMcpAllToolsMask;
+    std::string              toolSpec;
+};
 
+// The stdio server's dispatch policy. Same root plumbing as runMcpHttp(), building McpDispatchPolicy::defaultRoot
+// instead of ::pinnedRoot (D3/D4).
+inline McpDispatchPolicy mcpStdioPolicy( const McpStdioConfig& config )
+{
     // X7 (D3/D4): resolve the SOFT stdio default root, same shape as runMcpHttp()'s pinnedRoot resolution
     // (mcpWorkspaceKey for 2+ roots, else a plain mcpCanonRoot) but never refuses to start — a malformed
     // multi-root set just leaves defaultRoot empty (falls back to the pre-X7 "every request names its own
     // path" behavior) rather than exiting, since stdio has no analogous "refuse to bind" moment.
     std::string defaultRoot;
-    if( roots.size() >= 2 )
+    if( config.roots.size() >= 2 )
     {
         std::string wsErr;
-        const std::string key = mcpWorkspaceKey( roots, wsErr );
+        const std::string key = mcpWorkspaceKey( config.roots, wsErr );
         if( !key.empty() )
         {
             defaultRoot = mcpCanonRoot( key );
         }
     }
-    else if( !root.empty() )
+    else if( !config.root.empty() )
     {
-        defaultRoot = mcpCanonRoot( root );
+        defaultRoot = mcpCanonRoot( config.root );
     }
 
     // stdio: no HARD workspace pinning (pinnedRoot stays ""), edit verbs allowed; r2-LO: this process's one legend session
     McpDispatchPolicy policy{ .legendSession = &mcpStdioLegendSession() };
     policy.defaultRoot = defaultRoot;   // "" unless a startup root was given — see the comment above
+    policy.toolMask    = config.toolMask;  // --mcp-tools
+    policy.toolSpec    = config.toolSpec;
 
     // R2a (the 2026-08-12 usage mine): with NO startup root, resolve the launch cwd ONCE as the softest
     // default — see McpDispatchPolicy::assumedRoot for the full contract and mcpResolveAssumedRoot for
     // the guards ("/" and $HOME are nobody's workspace; getcwd failure degrades to the refusal).
     if( defaultRoot.empty() )
     {
-        policy.assumedRoot = mcpResolveAssumedRoot();
+        policy.assumedRoot = mcpResolveAssumedRoot( &policy.noRootReason );
     }
+    ENSURES( policy.pinnedRoot.empty(), "stdio never pins a workspace" );
+    return policy;
+}
+
+// stdio MCP loop: one JSON object per line. Returns the process exit code.
+inline int runMcp( const McpStdioConfig& config )
+{
+    // MEASURE-FIRST instrumentation (RIPWIRE_MCP_TIMINGS, off by default → byte-identical + silent server, same
+    // discipline as ingest.cpp's RIPWIRE_CACHE_STATS). When set, emit ONE stderr TSV line per handled request:
+    //   ripwire-timing verb=<v> wall_ms=<f> rebuilt=<0|1> vri=<0|1>
+    // (McpRequestTiming, mcpindex.h, writes it; vri=1: this request built the value-reference index.)
+    // stderr only, so the JSON-RPC stdout stream is untouched and every determinism/protocol gate is unaffected.
+    // NOTE: the design specified a `--mcp-timings` CLI flag; cli.h/main.cpp are owned by a concurrent agent this
+    // round, so we use the env var instead (recorded in bench/PROFILE.md's appendix) — same zero-cost-off contract.
+    const bool timingsOn = std::getenv( "RIPWIRE_MCP_TIMINGS" ) != nullptr;
+
+    const McpDispatchPolicy policy = mcpStdioPolicy( config );
 
     // R4: readByteSafeLineBounded, NOT std::getline( std::cin, ... ) — libc++'s getline narrows
     // int_type→char on every std::cin byte, so a single 0x80..0xFF request byte aborted the sanitizer
@@ -2346,11 +2932,9 @@ inline int runMcp( int topK, bool stable = false, bool noRedact = false,
         }
 
         // per-request timing capture (only when the env observable is on — zero clock/atomic work otherwise).
-        const std::chrono::steady_clock::time_point t0 =
-            timingsOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const std::uint64_t rebuildAtStart = timingsOn ? mcpRebuildCounter().load( std::memory_order_relaxed ) : 0;
+        const McpRequestTiming timing( timingsOn );
 
-        const McpDispatchResult r = dispatchMcpLine( line, topK, stable, noRedact, policy );
+        const McpDispatchResult r = dispatchMcpLine( line, config.topK, config.stable, config.noRedact, policy );
         if( r.isNotification )
         {
             continue;
@@ -2361,17 +2945,8 @@ inline int runMcp( int topK, bool stable = false, bool noRedact = false,
         std::fflush( stdout );
 
         // MEASURE-FIRST per-request timing line (stderr only, env-gated). Emitted AFTER the protocol response is
-        // flushed so it can never interleave into the JSON-RPC stdout stream. rebuilt=1 iff a full getIndex()
-        // rebuild fired somewhere in this request's handling (staleness / post-edit path).
-        if( timingsOn )
-        {
-            const double wallMs = std::chrono::duration< double, std::milli >(
-                                      std::chrono::steady_clock::now() - t0 ).count();
-            const unsigned rebuilt = ( mcpRebuildCounter().load( std::memory_order_relaxed ) != rebuildAtStart ) ? 1u : 0u;
-            rw::emitTo( stderr, "ripwire-timing verb={} wall_ms={:.3f} rebuilt={}\n",
-                          r.timingVerb.c_str(), wallMs, rebuilt );
-            std::fflush( stderr );
-        }
+        // flushed so it can never interleave into the JSON-RPC stdout stream (McpRequestTiming, mcpindex.h).
+        timing.emit( r.timingVerb );
     }
     return 0;
 }

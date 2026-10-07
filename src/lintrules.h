@@ -24,15 +24,19 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "model.h"              // Lang enum
+#include "depdialect.h"         // DepDialect + dependencyDialect — moved out of here for #358
 #include "ingest.h"             // AstQuerySpec, AstMatch, astQuery, IngestResult
 #include "docparse.h"           // detail::readWholeFile — THE canonical whole-file byte read; never re-rolled
 #include "infra/namesplit.h"   // namesplit::stripQuotePair — THE canonical quote-strip; never re-rolled
 #include "infra/Diagnostics.h"  // DISCLOSE (no-op in release; the fprintf below is the visible line)
+#include "infra/tablelookup.h"   // findByField
 
 namespace rw
 {
@@ -265,53 +269,9 @@ inline bool dependencyCapable( Lang lang ) noexcept
     return false;   // a byte past the enum
 }
 
-// The DEPENDENCY DIALECT a language's imports resolve in — the answer to "could an include edge from a
-// file of language A to a file of language B exist AT ALL". Per-file capability is not enough to answer
-// that: a Bash gate and the C++ translation unit it exercises are BOTH dependency-capable as of
-// kParserVer 81, and no `source` can ever name a .cpp. Anything that asks "is the ABSENCE of a static
-// dependency between these two informative?" (gitmine.h's `surprising=`) needs the pair form, or it
-// re-manufactures exactly the §A9.3 false positive — measured here, on this repo, before the change
-// landed: of 153 `dep_capable="0"` co-change rows in the top 400, a per-file-only flip would have turned
-// 88 capable, and 75 of those 88 are cross-dialect (.h↔.sh, .cpp↔.sh, .py↔.sh, .js↔.sh) and would have
-// rendered as "hidden architectural debt" that no include edge could ever have explained.
-//
-// One group per resolvable dialect; C-family is one group because a .c/.h/.cpp/.mm genuinely include one
-// another, and TS+JS is one group because their specifiers resolve against one shared extension ladder
-// (resolve.h::resolveTsImport). Every other language resolves only onto its own files (resolve.h's
-// Step-A candidate lists are extension-closed), so each is its own group. Java/Go/Swift/C#/PHP keep a
-// group despite being DEFERRED in the resolver: capability is about the language, not about how far this
-// tool currently resolves it, and a deferred pair is honestly "could carry one, we found none". Kotlin
-// joins Java's group rather than minting its own, for the SAME reason C-family is one group: a Kotlin
-// file genuinely imports a Java class and vice versa in a mixed Android/JVM module (graph.h's
-// langCompatible bridges the two for the same reason on the call-graph side) — a separate Kotlin dialect
-// would report a real cross-language import pair as "not defined" instead of "found none".
-enum class DepDialect : std::uint8_t { None = 0, CFamily, Web, Python, Rust, Go, Swift, Java, CSharp, Php, Bash, Ruby, Lua, Elixir };
-
-/// Return the dependency dialect of a language, or DepDialect::None when it carries no file dependency.
-inline DepDialect dependencyDialect( Lang lang ) noexcept
-{
-    switch( lang )
-    {
-        case Lang::Cpp: case Lang::C: case Lang::ObjC:  return DepDialect::CFamily;
-        case Lang::TypeScript: case Lang::JavaScript:   return DepDialect::Web;
-        case Lang::Python:                              return DepDialect::Python;
-        case Lang::Rust:                                return DepDialect::Rust;
-        case Lang::Go:                                  return DepDialect::Go;
-        case Lang::Swift:                               return DepDialect::Swift;
-        case Lang::Java: case Lang::Kotlin:              return DepDialect::Java;
-        case Lang::CSharp:                              return DepDialect::CSharp;
-        case Lang::Php:                                 return DepDialect::Php;
-        case Lang::Bash:                                return DepDialect::Bash;
-        case Lang::Ruby:                                return DepDialect::Ruby;
-        case Lang::Lua:                                 return DepDialect::Lua;
-        case Lang::Elixir:                              return DepDialect::Elixir;
-        case Lang::Dart:                                // not dependency-capable (dependencyCapable's DART paragraph)
-        case Lang::GDScript:                            // not dependency-capable (the same paragraph)
-        case Lang::Json: case Lang::Toml: case Lang::Yaml: case Lang::Markdown: case Lang::Unknown:
-                                                        return DepDialect::None;
-    }
-    return DepDialect::None;   // a byte past the enum
-}
+// DepDialect + dependencyDialect now live in depdialect.h: the import-capture round (#358) picks a
+// specifier normaliser per dialect from the ingest TU, which cannot include this header. The enum's
+// rationale moved with it, unchanged.
 
 // Could a physical dependency edge exist between a file of language `a` and one of language `b`, in
 // EITHER direction? Both sides must be dependency-capable AND share a dialect. Bash is the one language
@@ -1289,7 +1249,8 @@ inline bool errorMaskConfirmOnDisk( const IngestResult& ing, const AstMatch& m,
 
 // One error-masking hit: the suppressing block's file + start byte (so a caller can attribute it to the
 // enclosing symbol by span containment), the 1-based line, and the rule id. Shaped for span attribution,
-// not for direct emission — quality.h owns the delta accounting.
+// not for direct emission — quality.h owns the delta accounting. The same shape carries a PLACEHOLDER hit
+// (id "stub" or "todo"), which quality.h counts under its own kind.
 struct ErrorMaskHit
 {
     std::uint32_t fileId    = 0;
@@ -1298,50 +1259,72 @@ struct ErrorMaskHit
     std::string   id;
 };
 
-// Run the built-in error-masking table over the tree and return the surviving hits (empty-block filter
-// applied). Deterministic: astQuery sorts (file, startByte, tag); we keep that order and only drop
-// non-empty blocks for `emptyOnly` rules. Never throws (astQuery degrades per-file internally).
-inline std::vector<ErrorMaskHit> findErrorMasking( const IngestResult& ing )
+// ── which WIDENED error-masking shapes GATE, per language (noise control: only a measured-precise rule gates) ──
+// The kErrorMaskRules rows above (empty / pass / `...` / comment-only) always gate. The two handler shapes
+// from src/handlershape.h gate ONLY where a row below says so: their precision was hand-labelled on a sample
+// of real hits (docs/EVALS.md, "error-masking widened: log-only and rethrow-only") and a (shape, language)
+// pair gates only at a measured precision of 0.8 or better on at least 20 labelled hits. Every other pair —
+// including every language the sample could not reach — is REPORT-ONLY: its row is still printed, as
+// sev="minor", and never fires exit 2. A declarative table, so moving a pair across the line is one row.
+struct HandlerShapeGate
 {
-    std::vector<ErrorMaskHit> out;
-    if( ing.files.empty() )
-    {
-        return out;
-    }
+    Lang lang;
+    bool logOnlyGates;       // kShapeLogOnly gates in this language
+    bool rethrowOnlyGates;   // kShapeRethrowOnly gates in this language
+};
 
-    // Build one astQuery spec per rule, tagging with the rule index so the empty-block gate routes back.
-    std::vector<AstQuerySpec> specs;
-    specs.reserve( kErrorMaskRules.size() );
-    for( std::size_t r = 0; r < kErrorMaskRules.size(); ++r )
-    {
-        specs.push_back( { std::string( kErrorMaskRules[r].query ), std::to_string( r ) } );
-    }
+inline constexpr HandlerShapeGate kHandlerShapeGates[] = {
+    { Lang::Python, true, true },   // log-only 40 of 41 hand-labelled hits TRUE (0.976); rethrow-only 33 of 33 (1.000)
+};
 
-    // The @m block capture is the WIDEST node in each match (it encloses the inner @p property id), so it is
-    // the span astQuery reports for that match's block. But a match with a #eq? predicate also captures @p;
-    // filter to the block capture by picking, per (file,startByte) match, the row's node — astQuery emits one
-    // AstMatch per CAPTURE, so a swallow rule yields both a @p hit and a @m hit. We keep only the @m block by
-    // its emptiness signature: @p (a bare identifier "catch"/"then") is never "{}", and for non-emptyOnly
-    // Python rules @p does not exist, so every emitted capture is the block. Route by tag → rule.
+inline bool handlerShapeGates( std::string_view shape, Lang lang ) noexcept
+{
+    const HandlerShapeGate* row = findByField( kHandlerShapeGates, &HandlerShapeGate::lang, lang );
+    return row != nullptr && ( shape == kShapeLogOnly ? row->logOnlyGates : row->rethrowOnlyGates );
+}
+
+// Is this error-masking hit one of the classic always-gating rows, or a widened shape that gates in `lang`?
+inline bool errorMaskHitGates( std::string_view id, Lang lang ) noexcept
+{
+    return !( id == kShapeLogOnly || id == kShapeRethrowOnly ) || handlerShapeGates( id, lang );
+}
+
+// Both families --quality-delta counts per symbol, from ONE read and parse of the tree: the error-masking
+// hits (the kErrorMaskRules query rows plus the log-only / rethrow-only walk shapes) and the placeholder
+// hits (stub / todo). Each list is in (file path, startByte, id) order.
+struct QualityConstructHits
+{
+    std::vector<ErrorMaskHit> mask;
+    std::vector<ErrorMaskHit> placeholder;
+};
+
+// The rule index a query row was tagged with (its position in kErrorMaskRules), or kErrorMaskRules.size()
+// for a tag that is not one.
+inline std::size_t errorMaskRuleIndex( std::string_view tag ) noexcept
+{
+    std::uint64_t v = 0;
+    for( char c : tag )
+    {
+        if( c >= '0' && c <= '9' )
+        {
+            v = v * 10 + std::uint64_t( c - '0' );
+        }
+    }
+    return v < kErrorMaskRules.size() ? std::size_t( v ) : kErrorMaskRules.size();
+}
+
+// The query half: keep a row only when its rule's empty-block filter (and, for a comment-only block, the
+// raw-bytes confirm) says the block swallows. The @p identifier capture of the two promise rules is
+// dropped here too — a bare "catch"/"then" is never "{}".
+inline void keepErrorMaskQueryRows( const IngestResult& ing, std::vector<AstMatch>& rows, std::vector<ErrorMaskHit>& out )
+{
     // one-entry raw-bytes memo for the confirm below: astQuery already sorts (file, startByte, tag), so the
     // candidates of one file arrive together and a single slot is the whole cache.
     std::uint32_t rawFileId = ~std::uint32_t( 0 );
     std::string   rawBytes;
-
-    for( const AstMatch& m : astQuery( ing, specs ) )
+    for( const AstMatch& m : rows )
     {
-        std::size_t r = 0;
-        {
-            std::uint64_t v = 0;
-            for( char c : m.tag )
-            {
-                if( c >= '0' && c <= '9' )
-                {
-                    v = v * 10 + std::uint64_t( c - '0' );
-                }
-            }
-            r = std::size_t( v );
-        }
+        const std::size_t r = errorMaskRuleIndex( m.tag );
         if( r >= kErrorMaskRules.size() )
         {
             continue;
@@ -1349,25 +1332,56 @@ inline std::vector<ErrorMaskHit> findErrorMasking( const IngestResult& ing )
         const ErrorMaskRule& rule = kErrorMaskRules[r];
         if( rule.emptyOnly && !errorMaskBlockIsEmpty( m.text ) )
         {
-            continue; // the @p identifier capture is dropped here too (never "{}")
+            continue;
         }
-        if( rule.emptyOnly && !errorMaskBlockIsBareBraces( m.text )
-            && !errorMaskConfirmOnDisk( ing, m, rawFileId, rawBytes ) )
+        if( rule.emptyOnly && !errorMaskBlockIsBareBraces( m.text ) && !errorMaskConfirmOnDisk( ing, m, rawFileId, rawBytes ) )
         {
             continue;       // a comment OPENS the block but code follows it — that is a handler
         }
         out.push_back( { m.fileId, m.startByte, m.line, std::string( rule.id ) } );
     }
+}
 
-    // Deterministic order: (file path, startByte, id). astQuery already sorts (file, startByte, tag); re-sort
-    // on the final key so the id tiebreak is the rule id, not its numeric tag.
-    std::sort( out.begin(), out.end(), [ & ]( const ErrorMaskHit& a, const ErrorMaskHit& b )
-               {
-        if( ing.files[a.fileId] != ing.files[b.fileId] ) { return ing.files[a.fileId] < ing.files[b.fileId];
+// Deterministic order: (file path, startByte, id) — astQuery sorts (file, startByte, tag), and this re-sort
+// makes the tiebreak the rule id rather than its numeric tag.
+inline void sortConstructHits( const IngestResult& ing, std::vector<ErrorMaskHit>& hits )
+{
+    std::sort( hits.begin(), hits.end(), [ & ]( const ErrorMaskHit& a, const ErrorMaskHit& b )
+               { return std::tie( ing.files[a.fileId], a.startByte, a.id ) < std::tie( ing.files[b.fileId], b.startByte, b.id ); } );
 }
-        if( a.startByte != b.startByte ) { return a.startByte < b.startByte;
-}
-        return a.id < b.id; } );
+
+// Run the built-in error-masking table AND the handler/placeholder walk over the tree, in ONE shared read
+// and parse (astQueryGrouped: a spec group and an AstWalk::HandlerShapes group). BOTH groups' budgets are
+// unbounded on purpose: a per-tag cap truncates a PATH-sorted list, so the two sides of a delta would be cut
+// at different files and a TODO or a swallowing catch past the cap would read as added or removed — a phantom
+// preexisting-worse row that gates on untouched code. The spec group used to be capped at 5000 per tag, and
+// empty-catch-java / empty-catch-cfamily capture EVERY catch body (keepErrorMaskQueryRows filters after the
+// query), so a tree with more than 5000 catches crossed it. A match row is a few words; the cost stays linear in
+// the matches. Never throws (astQuery degrades per file internally).
+inline QualityConstructHits findQualityConstructs( const IngestResult& ing )
+{
+    QualityConstructHits out;
+    if( ing.files.empty() )
+    {
+        return out;
+    }
+    std::vector<AstQuerySpec> specs;
+    specs.reserve( kErrorMaskRules.size() );
+    for( std::size_t r = 0; r < kErrorMaskRules.size(); ++r )
+    {
+        specs.push_back( { std::string( kErrorMaskRules[r].query ), std::to_string( r ) } );
+    }
+    std::vector<std::vector<AstMatch>> groups = astQueryGrouped( ing, { { &specs, std::numeric_limits<std::size_t>::max(), nullptr },
+                                                                        { nullptr, std::numeric_limits<std::size_t>::max(), nullptr, AstWalk::HandlerShapes } } );
+    ASSUME( groups.size() == 2, "astQueryGrouped returns exactly one bucket per group it was given" );
+    keepErrorMaskQueryRows( ing, groups[0], out.mask );
+    for( const AstMatch& m : groups[1] )
+    {
+        const bool isPlaceholder = m.tag == kShapeStub || m.tag == kShapeTodo;
+        ( isPlaceholder ? out.placeholder : out.mask ).push_back( { m.fileId, m.startByte, m.line, m.tag } );
+    }
+    sortConstructHits( ing, out.mask );
+    sortConstructHits( ing, out.placeholder );
     return out;
 }
 

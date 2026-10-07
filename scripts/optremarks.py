@@ -81,6 +81,7 @@ HOT_FILES = (
     "src/ingest_relations.h",     # captureIncludes and the relation captures — the densest LoadClobbered cluster in the family (1,120 in one function)
     "src/ingest_metrics.h",       # cc_walk / complexityOf — a per-symbol AST walk for the quality metrics
     "src/ingest_cache.h",         # loadCache / saveCache / readFileRecord, per file record — ~10% of a WARM run, which is the run an agent actually pays for
+    "src/ingest_valuerefs.h",     # the reference-as-value walk, per node over every C/JS/TS/Python/Go file — +3.6..6.3% of a cold run
     "src/ingest_model.h",         # build-model: dedup, symbol-id assignment, the def-span index, the ref radix sort — per symbol and per reference, ~18% warm
 
     "src/resolve.h",              # reference resolution into the call graph
@@ -111,6 +112,18 @@ COLD_FILES = (
       "per-node tree-sitter walk — is covered by ingest_binds.h and ingest_relations.h, which run for every grammar." ),
     ( "src/ingest_elixir.h",
       "Elixir-specific capture helpers: per node, but for one grammar with a small corpus share. Same argument as ingest_jsimports.h above." ),
+    # ── per-DIRECTIVE, where every hot ingest section above is per-node or per-file ────────────────────
+    ( "src/ingest_importcap.h",
+      "the shared @import.path capture vocabulary (issue #358), carrying the C family for now. It is called from ONE place in ingest_sidecap.h and runs once per captured "
+      "#include/#import directive — a handful per file — where every HOT ingest section above runs per AST node or per file record, two to three orders of magnitude more often. "
+      "Its four functions are span copies and compares with no walk of their own, and the record they append is the one ingest_relations.h already appends. The parse that "
+      "produces the directives and the capture loop that calls this are BOTH already in the hot set (ingest_parsepool.h, ingest_sidecap.h), so the cost of an include stays "
+      "visible to --hot with this section out. REVISIT once the vocabulary stops being C-family-only: ~19 per-language extractors remain to move (issue #358), and when other "
+      "families land this is the shared path for every import in the tool rather than a per-directive tail — a different answer, and a hot one." ),
+
+    ( "src/handlershape.h",
+      "--quality-delta's handler and placeholder shape walk (AstWalk::HandlerShapes). The AST-query engine in ingest_astquery.h drives it, so like that "
+      "engine it does not run at all on a plain `ripwire <dir>`, and a remark here cannot move the number every other verb pays." ),
 
     # ── the other translation units under src/ ────────────────────────────────────────────────────
     ( "src/main.cpp",
