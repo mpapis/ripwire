@@ -124,15 +124,16 @@ done
 [ "$( callershead ref )"        = 'of="ref" defs="1" count="0"' ] \
     && ok "defs-only false-binding: a COLUMN-ONLY name (ref) gains no caller from an unrelated 'obj.ref' style site — pre-change it did bind (untyped receivers)" \
     || no "defs-only: ref callers: $( callershead ref )"
-[ "$( callershead name )"       = 'of="name" defs="19" count="3"' ] \
-    && ok 'defs-only: the 3 name caller rows come from the METHOD/attr defs only — the 9 columns contribute zero edges to the 19-def set' \
+[ "$( callershead name )"       = 'of="name" defs="19" count="1"' ] \
+    && [ "$( "$BIN" "$FIX" --callers=name --no-cache 2>/dev/null | grep -oE 't="method"' | head -1 )" = 't="method"' ] \
+    && ok 'defs-only: the name caller row is the METHOD render_label (consumer_ambiguous.rb:7) — the 9 columns contribute zero edges to the 19-def set (the other two fixture sites now decline as reads: hop_untested + declined_calls disclosed, train-26a ruby lane)' \
     || no "defs-only: name callers: $( callershead name )"
 
 # ── 4. AMBIGUITY + LOCALITY: the resolver splits honestly, pins on evidence ─────────────────────────
 "$BIN" "$FIX" --uses=name --no-cache 2>/dev/null >"$TMP/uses_name"
 grep -q 'of="name" defs="19" external="0" count="3"' "$TMP/uses_name" \
-    && grep -q 'graph_ambiguous="2"' "$TMP/uses_name" \
-    && ok 'ambiguity: the name gauge counts ONLY the 2 sites that still split over real (method/attr) defs — the id/created_at column sites left the gauge once columns stopped taking edges' \
+    && grep -q 'graph_ambiguous="1"' "$TMP/uses_name" \
+    && ok 'ambiguity: the name gauge counts ONLY the 1 site that still splits over real (method/attr) defs — the id/created_at column sites left the gauge once columns stopped taking edges, and the train-26a ruby lane declines the second fixture site as a read (declined_calls disclosed)' \
     || no 'ambiguity: name gauge/rows wrong'
 grep -q 'p="consumer_ambiguous.rb:8"' "$TMP/uses_name" \
     && ok 'ambiguous arm: rec.name on a plain local SPLITS over the whole def set (its row is in the gauge)' \

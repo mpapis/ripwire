@@ -2180,15 +2180,30 @@ inline std::string cacheRootKeyHex( const std::string& root )
 // not include this header; it relies on ingest.cpp including quality.h (line 13) before ingest_cache.h, and a reorder
 // that broke that fails the build on the undeclared name rather than passing.
 constexpr std::uint32_t kIngestCacheVersionMirror   = 28;   // MUST equal ingest.cpp's kCacheVersion (gated); 28 = FE-A ref memberCall/memberRoot, 27 = corrected fnScope values, 26 = function-local def scope span (25 = #157 + #150)
-constexpr std::uint32_t kIngestParserVerMirror    = 144;  // MUST equal ingest.cpp's kParserVer   (gated)
-                                                          // 144 = 2026-10-07 (#339, Rails db/schema.rb columns; carried as 126,
-                                                          //   renumbered to 144 because trains 22-25 landed 128-143; DEFINITIONS
-                                                          //   ONLY — no Section-Ruby call edges; kIngestCacheVersionMirror stays 28)
+constexpr std::uint32_t kIngestParserVerMirror    = 149;  // MUST equal ingest.cpp's kParserVer   (gated)
+                                                          // 149 = 2026-10-08 (merge #3: carried 126 -> 144 -> 149; the
+                                                          //   Rails schema-column capture, DEFINITIONS ONLY — no Section-Ruby
+                                                          //   call edges; trains 22-26a took 128-148)
+                                                          // 148 = 2026-10-04 (train 26a: PR #373 merged; above the branch's 145 and the 145–147
+                                                          //   lanes in flight, see kParserVer note; kIngestCacheVersionMirror stays main's 28)
                                                           // 141 = 2026-10-04 (train 25: above FE-A's 134/135 and refval-edges' 140, see kParserVer
                                                           //   note; kIngestCacheVersionMirror 28 from FE-A, kQSnapCacheScheme 17 from refval-edges)
                                                           // 140 = lane refval-edges (reference-as-value rows; see kParserVer note)
                                                           // 135 = 2026-10-03 (lane FE-A fix round, see kParserVer note)
                                                           // 134 = 2026-10-03 (lane FE-A, see kParserVer note; 133 is train 24's)
+                                                          // --- PR #373 branch numbers (lane-local; its 130–132 are NOT main's) ---
+                                                          // 145 = 2026-10-04 (Ruby include and extend sides, see kParserVer
+                                                          //   note; kIngestCacheVersionMirror stays 27)
+                                                          // 142 = 2026-10-04 (the Ruby method-lookup branch on main 2720d1c5:
+                                                          //   above main's 133, train 25's 141 and the branch's carried 130–137,
+                                                          //   see kParserVer note; kIngestCacheVersionMirror stays 27)
+                                                          // 132 = 2026-10-02 (Ruby typed receivers, see kParserVer note;
+                                                          //   kIngestCacheVersionMirror stays 27)
+                                                          // 131 = 2026-10-02 (Ruby mixins are ancestors, see kParserVer note;
+                                                          //   kIngestCacheVersionMirror stays 27)
+                                                          // 130 = 2026-10-01 (Ruby bare-word calls, see kParserVer note;
+                                                          //   kIngestCacheVersionMirror stays 27)
+                                                          // --- end of PR #373 branch numbers; main's history continues ---
                                                           // 133 = 2026-10-02 (train 24: above the merged lanes' 130 and 131 extraction
                                                           //   changes and train 23's 132, see kParserVer note; kIngestCacheVersionMirror stays 27)
                                                           // 132 = 2026-10-02 (train 23: cache-key hygiene above every branch
